@@ -733,8 +733,21 @@ function applyLinuxTrayPatch(currentSource, iconPathExpression) {
     // Already patched.
   } else if (patchedSource.includes(closeToTrayNeedle)) {
     patchedSource = patchedSource.replace(closeToTrayNeedle, closeToTrayPatch);
+  } else if (/\(process\.platform===`win32`\|\|process\.platform===`linux`\)&&[A-Za-z_$][\w$]*===`local`/.test(patchedSource)) {
+    // Already patched with a newer minifier's window variable.
   } else {
-    console.warn("WARN: Could not find close-to-tray condition — skipping Linux close-to-tray patch");
+    const closeToTrayRegex =
+      /if\(process\.platform===`win32`&&([A-Za-z_$][\w$]*)===`local`&&!this\.isAppQuitting&&this\.options\.canHideLastLocalWindowToTray\?\.\(\)===!0&&!([A-Za-z_$][\w$]*)\)\{([A-Za-z_$][\w$]*)\.preventDefault\(\),([A-Za-z_$][\w$]*)\.hide\(\);return\}/;
+    const closeToTrayMatch = patchedSource.match(closeToTrayRegex);
+    if (closeToTrayMatch != null) {
+      const [, hostVar, hasOtherWindowVar, eventVar, windowVar] = closeToTrayMatch;
+      patchedSource = patchedSource.replace(
+        closeToTrayRegex,
+        `if((process.platform===\`win32\`||process.platform===\`linux\`)&&${hostVar}===\`local\`&&!this.isAppQuitting&&this.options.canHideLastLocalWindowToTray?.()===!0&&!${hasOtherWindowVar}){${eventVar}.preventDefault(),${windowVar}.hide();return}`,
+      );
+    } else {
+      console.warn("WARN: Could not find close-to-tray condition — skipping Linux close-to-tray patch");
+    }
   }
 
   const trayContextMethodNeedle =
@@ -823,7 +836,27 @@ function applyLinuxTrayPatch(currentSource, iconPathExpression) {
   } else if (patchedSource.includes(trayStartupNeedle)) {
     patchedSource = patchedSource.replace(trayStartupNeedle, trayStartupPatch);
   } else {
-    console.warn("WARN: Could not find tray startup call — skipping Linux tray startup patch");
+    const traySetupMatch = patchedSource.match(
+      /let ([A-Za-z_$][\w$]*)=async\(\)=>\{[A-Za-z_$][\w$]*=!0;try\{await [A-Za-z_$][\w$]*\(\{buildFlavor:/,
+    );
+    const trayStartupRegex = traySetupMatch == null
+      ? null
+      : new RegExp(`([A-Za-z_$][\\w$]*)&&${traySetupMatch[1]}\\(\\);`);
+    const dynamicTrayStartupMatch = trayStartupRegex == null ? null : patchedSource.match(trayStartupRegex);
+    if (
+      traySetupMatch != null &&
+      patchedSource.includes(`process.platform===\`linux\`&&codexLinuxIsTrayEnabled())&&${traySetupMatch[1]}();`)
+    ) {
+      // Already patched with a newer minifier's tray setup identifier.
+    } else if (dynamicTrayStartupMatch != null) {
+      const isWindowsVar = dynamicTrayStartupMatch[1];
+      patchedSource = patchedSource.replace(
+        trayStartupRegex,
+        `(${isWindowsVar}||process.platform===\`linux\`&&codexLinuxIsTrayEnabled())&&${traySetupMatch[1]}();`,
+      );
+    } else {
+      console.warn("WARN: Could not find tray startup call — skipping Linux tray startup patch");
+    }
   }
 
   return patchedSource;
@@ -840,6 +873,8 @@ function applyLinuxSingleInstancePatch(currentSource) {
     // Already patched.
   } else if (patchedSource.includes(singleInstanceLockNeedle)) {
     patchedSource = patchedSource.replace(singleInstanceLockNeedle, singleInstanceLockPatch);
+  } else if (patchedSource.includes("setSecondInstanceArgsHandler")) {
+    // Newer bundles take the single-instance lock in bootstrap.js and hand args into main here.
   } else {
     console.warn("WARN: Could not find startup handoff point — skipping Linux single-instance lock patch");
   }
@@ -852,6 +887,8 @@ function applyLinuxSingleInstancePatch(currentSource) {
     // Already patched.
   } else if (patchedSource.includes(secondInstanceHandlerNeedle)) {
     patchedSource = patchedSource.replace(secondInstanceHandlerNeedle, secondInstanceHandlerPatch);
+  } else if (patchedSource.includes("setSecondInstanceArgsHandler")) {
+    // bootstrap.js owns the Electron second-instance event and calls this bundle's handler.
   } else {
     console.warn("WARN: Could not find second-instance handler — skipping Linux second-instance focus patch");
   }
@@ -860,29 +897,34 @@ function applyLinuxSingleInstancePatch(currentSource) {
 }
 
 function applyLinuxComputerUsePluginGatePatch(currentSource) {
-  const computerUseGateNeedle =
-    "{name:tn,isEnabled:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:wn}";
-  const computerUseLinuxGateNeedle =
-    "{name:tn,isEnabled:({features:e,platform:t})=>(t===`darwin`||t===`linux`)&&e.computerUse,migrate:wn}";
-  const computerUseGatePatch =
-    "{installWhenMissing:!0,name:tn,isEnabled:({features:e,platform:t})=>(t===`darwin`||t===`linux`)&&e.computerUse,migrate:wn}";
-
-  if (currentSource.includes(computerUseGatePatch)) {
+  const enabledGateRegex =
+    /\{installWhenMissing:!0,name:([A-Za-z_$][\w$]*),isEnabled:\(\{features:([A-Za-z_$][\w$]*),platform:([A-Za-z_$][\w$]*)\}\)=>\(\3===`darwin`\|\|\3===`linux`\)&&\2\.computerUse,migrate:([A-Za-z_$][\w$]*)\}/;
+  if (enabledGateRegex.test(currentSource)) {
     return currentSource;
   }
 
-  if (currentSource.includes(computerUseGateNeedle)) {
-    return currentSource.replace(computerUseGateNeedle, computerUseGatePatch);
-  }
-
-  if (currentSource.includes(computerUseLinuxGateNeedle)) {
-    return currentSource.replace(computerUseLinuxGateNeedle, computerUseGatePatch);
-  }
-
-  if (currentSource.includes("`computer-use`") && currentSource.includes("e.computerUse")) {
-    console.warn(
-      "WARN: Could not find Computer Use plugin platform gate — skipping Linux Computer Use gate patch",
+  const darwinOnlyGateRegex =
+    /\{(?:installWhenMissing:!0,)?name:([A-Za-z_$][\w$]*),isEnabled:\(\{features:([A-Za-z_$][\w$]*),platform:([A-Za-z_$][\w$]*)\}\)=>\3===`darwin`&&\2\.computerUse,migrate:([A-Za-z_$][\w$]*)\}/;
+  if (darwinOnlyGateRegex.test(currentSource)) {
+    return currentSource.replace(
+      darwinOnlyGateRegex,
+      (_match, nameVar, featuresVar, platformVar, migrateVar) =>
+        `{installWhenMissing:!0,name:${nameVar},isEnabled:({features:${featuresVar},platform:${platformVar}})=>(${platformVar}===\`darwin\`||${platformVar}===\`linux\`)&&${featuresVar}.computerUse,migrate:${migrateVar}}`,
     );
+  }
+
+  const linuxGateWithoutInstallRegex =
+    /\{name:([A-Za-z_$][\w$]*),isEnabled:\(\{features:([A-Za-z_$][\w$]*),platform:([A-Za-z_$][\w$]*)\}\)=>\(\3===`darwin`\|\|\3===`linux`\)&&\2\.computerUse,migrate:([A-Za-z_$][\w$]*)\}/;
+  if (linuxGateWithoutInstallRegex.test(currentSource)) {
+    return currentSource.replace(
+      linuxGateWithoutInstallRegex,
+      (_match, nameVar, featuresVar, platformVar, migrateVar) =>
+        `{installWhenMissing:!0,name:${nameVar},isEnabled:({features:${featuresVar},platform:${platformVar}})=>(${platformVar}===\`darwin\`||${platformVar}===\`linux\`)&&${featuresVar}.computerUse,migrate:${migrateVar}}`,
+    );
+  }
+
+  if (currentSource.includes("`computer-use`") && currentSource.includes("computerUse")) {
+    throw new Error("Required Linux Computer Use plugin gate patch failed: could not enable bundled Computer Use on Linux");
   }
 
   return currentSource;
@@ -921,16 +963,27 @@ function applyBrowserAnnotationScreenshotPatch(currentSource) {
 function applyLinuxTrayCloseSettingPatch(currentSource) {
   let patchedSource = currentSource;
 
-  const closeGateNeedle = "canHideLastLocalWindowToTray:()=>O,disposables:k";
-  const closeGatePatch =
-    `canHideLastLocalWindowToTray:()=>O&&(process.platform!==\`linux\`||M.globalState.get(\`${linuxSettingsKeys.systemTray}\`)!==!1),disposables:k`;
-
-  if (patchedSource.includes(closeGatePatch)) {
+  if (
+    patchedSource.includes("canHideLastLocalWindowToTray:()=>") &&
+    patchedSource.includes("process.platform!==`linux`||") &&
+    patchedSource.includes(linuxSettingsKeys.systemTray)
+  ) {
     return patchedSource;
   }
 
-  if (patchedSource.includes(closeGateNeedle)) {
-    return patchedSource.replace(closeGateNeedle, closeGatePatch);
+  const closeGateRegex =
+    /canHideLastLocalWindowToTray:\(\)=>([A-Za-z_$][\w$]*),disposables:([A-Za-z_$][\w$]*)/;
+  const closeGateMatch = patchedSource.match(closeGateRegex);
+  if (closeGateMatch != null) {
+    const [, trayReadyVar, disposableVar] = closeGateMatch;
+    const prefix = patchedSource.slice(Math.max(0, closeGateMatch.index - 8000), closeGateMatch.index);
+    const globalStateExpr = findLinuxGlobalStateExpression(prefix);
+    if (globalStateExpr != null) {
+      return patchedSource.replace(
+        closeGateRegex,
+        `canHideLastLocalWindowToTray:()=>${trayReadyVar}&&(process.platform!==\`linux\`||${globalStateExpr}.get(\`${linuxSettingsKeys.systemTray}\`)!==!1),disposables:${disposableVar}`,
+      );
+    }
   }
 
   if (patchedSource.includes("canHideLastLocalWindowToTray") && patchedSource.includes("Launching app")) {
@@ -938,6 +991,193 @@ function applyLinuxTrayCloseSettingPatch(currentSource) {
   }
 
   return patchedSource;
+}
+
+function findMatchingBrace(source, openIndex) {
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+
+  for (let i = openIndex; i < source.length; i += 1) {
+    const char = source[i];
+    if (quote != null) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = null;
+      }
+      continue;
+    }
+
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+
+  return -1;
+}
+
+function findLastRegexMatch(source, regex) {
+  regex.lastIndex = 0;
+  let lastMatch = null;
+  let match;
+  while ((match = regex.exec(source)) != null) {
+    lastMatch = match;
+    if (match[0].length === 0) {
+      regex.lastIndex += 1;
+    }
+  }
+  return lastMatch;
+}
+
+function findLinuxGlobalStateExpression(prefix) {
+  const objectStateMatch = findLastRegexMatch(prefix, /(?:let|,)\s*([A-Za-z_$][\w$]*)=\{globalState:/g);
+  if (objectStateMatch != null) {
+    return `${objectStateMatch[1]}.globalState`;
+  }
+
+  const propertyStateMatch = findLastRegexMatch(prefix, /globalState:([A-Za-z_$][\w$]*)\.globalState/g);
+  if (propertyStateMatch != null) {
+    return `${propertyStateMatch[1]}.globalState`;
+  }
+
+  return null;
+}
+
+function buildSemanticLinuxLaunchActionPatch({
+  setterVar,
+  deepLinksVar,
+  fallbackFn,
+  openerFn,
+  windowManagerVar,
+  hostExpr,
+  currentWindowVar,
+  createdWindowVar,
+  routeVar,
+  focusFn,
+  notificationVar,
+  globalStateExpr,
+  reporterVar,
+  disposableVar,
+  pathVar,
+  fsVar,
+  netVar,
+  appVar,
+}) {
+  const notificationPrefix = notificationVar == null
+    ? ""
+    : `${notificationVar}.desktopNotificationManager.dismissByNavigationPath(e),`;
+  const directHandler = appVar == null
+    ? ""
+    : `,codexLinuxSecondInstanceHandler=(e,t)=>{codexLinuxHandleLaunchActionArgsFallback(t,()=>{${fallbackFn}()})}`;
+  const startup = appVar == null
+    ? `process.platform===\`linux\`&&codexLinuxStartLaunchActionSocket();${setterVar}(e=>{codexLinuxHandleLaunchActionArgsFallback(e,()=>{${fallbackFn}()})});`
+    : `process.platform===\`linux\`&&(codexLinuxStartLaunchActionSocket(),${appVar}.app.on(\`second-instance\`,codexLinuxSecondInstanceHandler),${disposableVar}.add(()=>{${appVar}.app.off(\`second-instance\`,codexLinuxSecondInstanceHandler)}));${setterVar}(e=>{codexLinuxHandleLaunchActionArgsFallback(e,()=>{${fallbackFn}()})});`;
+
+  return `let codexLinuxGetSetting=e=>process.platform!==\`linux\`||${globalStateExpr}.get(e)!==!1,codexLinuxIsTrayEnabled=()=>codexLinuxGetSetting(\`${linuxSettingsKeys.systemTray}\`),codexLinuxIsWarmStartEnabled=()=>codexLinuxGetSetting(\`${linuxSettingsKeys.warmStart}\`),codexLinuxIsPromptWindowEnabled=()=>codexLinuxGetSetting(\`${linuxSettingsKeys.promptWindow}\`),${openerFn}=async(e,t)=>{${windowManagerVar}.hotkeyWindowLifecycleManager.hide();let ${currentWindowVar}=${windowManagerVar}.getPrimaryWindow(${hostExpr}),${createdWindowVar}=${currentWindowVar}??await ${windowManagerVar}.createFreshLocalWindow(e);${createdWindowVar}!=null&&(${notificationPrefix}${currentWindowVar}!=null&&t.navigateExistingWindow&&${routeVar}.navigateToRoute(${createdWindowVar},e),${focusFn}(${createdWindowVar}))},codexLinuxGetHotkeyWindowController=()=>typeof ${windowManagerVar}.hotkeyWindowLifecycleManager.ensureHotkeyWindowController===\`function\`?${windowManagerVar}.hotkeyWindowLifecycleManager.ensureHotkeyWindowController():${windowManagerVar}.hotkeyWindowLifecycleManager,codexLinuxShowHotkeyWindow=async()=>{let e=codexLinuxGetHotkeyWindowController();typeof e.openHome===\`function\`?await e.openHome():typeof e.show===\`function\`?await e.show():await ${windowManagerVar}.ensureHostWindow(${hostExpr})},codexLinuxOpenQuickChat=async()=>{${windowManagerVar}.hotkeyWindowLifecycleManager.hide();let e=${windowManagerVar}.getPrimaryWindow(${hostExpr}),t=e??await ${windowManagerVar}.createFreshLocalWindow(\`/\`);t!=null&&(${windowManagerVar}.windowManager.sendMessageToWindow(t,{type:\`new-quick-chat\`}),${focusFn}(t))},codexLinuxHasDeepLink=e=>Array.isArray(e)&&e.some(e=>typeof e===\`string\`&&(e.startsWith(\`codex://\`)||e.startsWith(\`codex-browser-sidebar://\`))),codexLinuxHandleLaunchActionArgs=async e=>codexLinuxHasDeepLink(e)&&${deepLinksVar}.deepLinks.queueProcessArgs(e)?!0:Array.isArray(e)&&(e.includes(\`--prompt-chat\`)||e.includes(\`--hotkey-window\`))?(codexLinuxIsPromptWindowEnabled()?(await codexLinuxShowHotkeyWindow(),!0):!1):Array.isArray(e)&&e.includes(\`--quick-chat\`)?(await codexLinuxOpenQuickChat(),!0):Array.isArray(e)&&e.includes(\`--new-chat\`)?(await ${openerFn}(\`/\`,{navigateExistingWindow:!0}),!0):!1,codexLinuxHandleLaunchActionArgsFallback=(e,t)=>{codexLinuxHandleLaunchActionArgs(e).then(e=>{e||t()}).catch(e=>{${reporterVar}.reportNonFatal(e instanceof Error?e:\`Failed to handle Linux launch action\`,{kind:\`linux-launch-action-failed\`}),t()})},codexLinuxPrewarmHotkeyWindow=()=>{if(!codexLinuxIsPromptWindowEnabled())return;try{let e=codexLinuxGetHotkeyWindowController();typeof e.prewarm===\`function\`&&e.prewarm()}catch(e){${reporterVar}.reportNonFatal(e instanceof Error?e:\`Failed to prewarm Linux hotkey window\`,{kind:\`linux-hotkey-window-prewarm-failed\`})}},codexLinuxStartLaunchActionSocket=()=>{let e=process.env.CODEX_DESKTOP_LAUNCH_ACTION_SOCKET?.trim();if(process.platform!==\`linux\`||!e||!codexLinuxIsWarmStartEnabled())return;try{${fsVar}.mkdirSync(${pathVar}.default.dirname(e),{recursive:!0,mode:448}),${fsVar}.rmSync(e,{force:!0});let t=${netVar}.default.createServer(t=>{let n=\`\`,r=!1,i=()=>{if(r)return;r=!0;let i=[];try{let e=JSON.parse(n.trim());Array.isArray(e.argv)&&(i=e.argv.filter(e=>typeof e===\`string\`))}catch(e){t.end?.(\`error\\n\`);return}codexLinuxHandleLaunchActionArgs(i).then(e=>e?void 0:${fallbackFn}()).then(()=>{t.end?.(\`ok\\n\`)}).catch(e=>{${reporterVar}.reportNonFatal(e instanceof Error?e:\`Failed to handle Linux launch action socket\`,{kind:\`linux-launch-action-socket-failed\`}),t.end?.(\`error\\n\`)})};t.setEncoding?.(\`utf8\`),t.on(\`data\`,e=>{n+=e,n.includes(\`\\n\`)?i():n.length>65536&&t.destroy()}),t.on(\`end\`,i)});t.on(\`error\`,e=>{${reporterVar}.reportNonFatal(e instanceof Error?e:\`Failed Linux launch action socket\`,{kind:\`linux-launch-action-socket-error\`})}),t.listen(e),${disposableVar}.add(()=>{t.close(),${fsVar}.rmSync(e,{force:!0})})}catch(e){${reporterVar}.reportNonFatal(e instanceof Error?e:\`Failed to start Linux launch action socket\`,{kind:\`linux-launch-action-socket-start-failed\`})}}${directHandler};${startup}`;
+}
+
+function applySemanticLinuxLaunchActionArgsPatch(currentSource) {
+  const handlerRegex =
+    /([A-Za-z_$][\w$]*)\(e=>\{([A-Za-z_$][\w$]*)\.deepLinks\.queueProcessArgs\(e\)\|\|([A-Za-z_$][\w$]*)\(\)\}\);let ([A-Za-z_$][\w$]*)=async\(e,t\)=>\{/g;
+  let match;
+  while ((match = handlerRegex.exec(currentSource)) != null) {
+    const [, setterVar, deepLinksVar, fallbackFn, openerFn] = match;
+    const openerLetIndex = currentSource.indexOf(`let ${openerFn}=async(e,t)=>{`, match.index);
+    if (openerLetIndex === -1) {
+      continue;
+    }
+
+    const openerBraceIndex = openerLetIndex + `let ${openerFn}=async(e,t)=>`.length;
+    const openerEnd = findMatchingBrace(currentSource, openerBraceIndex);
+    if (openerEnd === -1) {
+      continue;
+    }
+
+    const separator = currentSource[openerEnd + 1];
+    if (separator !== ";" && separator !== ",") {
+      continue;
+    }
+
+    const openerText = currentSource.slice(openerLetIndex, openerEnd + 1);
+    const openerVars = openerText.match(
+      /([A-Za-z_$][\w$]*)\.hotkeyWindowLifecycleManager\.hide\(\);let ([A-Za-z_$][\w$]*)=\1\.getPrimaryWindow\(([^)]+)\),([A-Za-z_$][\w$]*)=\2\?\?await \1\.createFreshLocalWindow\(e\);/,
+    );
+    if (openerVars == null) {
+      continue;
+    }
+
+    const [, windowManagerVar, currentWindowVar, hostExpr, createdWindowVar] = openerVars;
+    const routeVar = openerText.match(/([A-Za-z_$][\w$]*)\.navigateToRoute\([A-Za-z_$][\w$]*,e\)/)?.[1];
+    const focusFn = openerText.match(new RegExp(`,([A-Za-z_$][\\w$]*)\\(${createdWindowVar}\\)\\)\\}$`))?.[1];
+    if (routeVar == null || focusFn == null) {
+      continue;
+    }
+
+    const prefix = currentSource.slice(Math.max(0, match.index - 12000), match.index);
+    const globalStateExpr = findLinuxGlobalStateExpression(prefix);
+    const reporterVar = findLastRegexMatch(
+      prefix,
+      /([A-Za-z_$][\w$]*)\.reportNonFatal\(e instanceof Error\?e:`Failed to open window on second instance`/g,
+    )?.[1] ?? findLastRegexMatch(prefix, /([A-Za-z_$][\w$]*)=\{reportNonFatal/g)?.[1];
+    const disposableVar = findLastRegexMatch(prefix, /disposables:([A-Za-z_$][\w$]*)/g)?.[1]
+      ?? findLastRegexMatch(prefix, /([A-Za-z_$][\w$]*)=new [A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*;\1\.add\(/g)?.[1];
+    const pathVar = requireName(currentSource, "node:path");
+    const fsVar = requireName(currentSource, "node:fs");
+    const netVar = requireName(currentSource, "node:net");
+    if (globalStateExpr == null || reporterVar == null || disposableVar == null || pathVar == null || fsVar == null || netVar == null) {
+      continue;
+    }
+
+    let replaceStart = match.index;
+    let appVar = null;
+    const directStart = currentSource.lastIndexOf("let codexLinuxSecondInstanceHandler=", match.index);
+    if (directStart !== -1 && match.index - directStart < 1200) {
+      const directBlock = currentSource.slice(directStart, match.index);
+      const appMatch = directBlock.match(/([A-Za-z_$][\w$]*)\.app\.on\(`second-instance`,codexLinuxSecondInstanceHandler\)/);
+      if (appMatch != null) {
+        replaceStart = directStart;
+        appVar = appMatch[1];
+      }
+    }
+
+    const notificationVar = openerText.match(
+      /([A-Za-z_$][\w$]*)\.desktopNotificationManager\.dismissByNavigationPath\(e\)/,
+    )?.[1] ?? null;
+    const replacement = buildSemanticLinuxLaunchActionPatch({
+      setterVar,
+      deepLinksVar,
+      fallbackFn,
+      openerFn,
+      windowManagerVar,
+      hostExpr: hostExpr.trim(),
+      currentWindowVar,
+      createdWindowVar,
+      routeVar,
+      focusFn,
+      notificationVar,
+      globalStateExpr,
+      reporterVar,
+      disposableVar,
+      pathVar,
+      fsVar,
+      netVar,
+      appVar,
+    });
+    const suffix = separator === "," ? "let " : "";
+    return currentSource.slice(0, replaceStart) + replacement + suffix + currentSource.slice(openerEnd + 2);
+  }
+
+  return currentSource;
 }
 
 function applyLinuxLaunchActionArgsPatch(currentSource) {
@@ -997,6 +1237,11 @@ function applyLinuxLaunchActionArgsPatch(currentSource) {
     return patchedSource;
   }
 
+  const semanticLaunchActionPatch = applySemanticLinuxLaunchActionArgsPatch(patchedSource);
+  if (semanticLaunchActionPatch !== patchedSource) {
+    return semanticLaunchActionPatch;
+  }
+
   if (patchedSource.includes(oldLaunchActionPatch)) {
     patchedSource = patchedSource.replace(oldLaunchActionPatch, launchActionPatch);
   } else if (patchedSource.includes(deepLinkFirstLaunchActionPatch)) {
@@ -1050,6 +1295,12 @@ function applyLinuxHotkeyWindowPrewarmPatch(currentSource) {
     return patchedSource;
   }
 
+  if (
+    /process\.platform===`linux`&&codexLinuxPrewarmHotkeyWindow\(\),[A-Za-z_$][\w$]*=Date\.now\(\),await [A-Za-z_$][\w$]*\.deepLinks\.flushPendingDeepLinks\(\)/.test(patchedSource)
+  ) {
+    return patchedSource;
+  }
+
   const startupPrewarmNeedle =
     "w(`local window ensured`,A,{hostId:z,localWindowVisible:me?.isVisible()??!1}),A=Date.now(),await R.deepLinks.flushPendingDeepLinks()";
 
@@ -1060,7 +1311,18 @@ function applyLinuxHotkeyWindowPrewarmPatch(currentSource) {
   ) {
     // Already patched by an older run.
   } else {
-    console.warn("WARN: Could not find Linux hotkey window prewarm insertion point — skipping startup prewarm patch");
+    const dynamicStartupPrewarmRegex =
+      /(w\(`local window ensured`,([A-Za-z_$][\w$]*),\{hostId:([A-Za-z_$][\w$]*),localWindowVisible:[^}]+\}\),)\2=Date\.now\(\),await ([A-Za-z_$][\w$]*)\.deepLinks\.flushPendingDeepLinks\(\)/;
+    const dynamicStartupPrewarmMatch = patchedSource.match(dynamicStartupPrewarmRegex);
+    if (dynamicStartupPrewarmMatch != null) {
+      const [, prefix, timeVar, , deepLinksVar] = dynamicStartupPrewarmMatch;
+      patchedSource = patchedSource.replace(
+        dynamicStartupPrewarmRegex,
+        `${prefix}process.platform===\`linux\`&&codexLinuxPrewarmHotkeyWindow(),${timeVar}=Date.now(),await ${deepLinksVar}.deepLinks.flushPendingDeepLinks()`,
+      );
+    } else {
+      console.warn("WARN: Could not find Linux hotkey window prewarm insertion point — skipping startup prewarm patch");
+    }
   }
 
   return patchedSource;

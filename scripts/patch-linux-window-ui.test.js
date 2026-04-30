@@ -246,6 +246,25 @@ test("adds installWhenMissing to an already Linux-enabled Computer Use gate", ()
   assert.equal((patched.match(/installWhenMissing:!0,name:tn/g) || []).length, 1);
 });
 
+test("handles reordered Computer Use gate destructuring", () => {
+  const darwinOnlySource = [
+    "var tn=`computer-use`;",
+    "var $n=[{name:tn,isEnabled:({platform:t,features:e})=>t===`darwin`&&e.computerUse,migrate:wn}];",
+  ].join("");
+  const alreadyLinuxEnabledSource = [
+    "var tn=`computer-use`;",
+    "var $n=[{installWhenMissing:!0,name:tn,isEnabled:({platform:t,features:e})=>(t===`darwin`||t===`linux`)&&e.computerUse,migrate:wn}];",
+  ].join("");
+
+  const patched = applyPatchTwice(applyLinuxComputerUsePluginGatePatch, darwinOnlySource);
+
+  assert.match(
+    patched,
+    /\{installWhenMissing:!0,name:tn,isEnabled:\(\{features:e,platform:t\}\)=>\(t===`darwin`\|\|t===`linux`\)&&e\.computerUse,migrate:wn\}/,
+  );
+  assert.equal(applyPatchTwice(applyLinuxComputerUsePluginGatePatch, alreadyLinuxEnabledSource), alreadyLinuxEnabledSource);
+});
+
 test("patches the current Computer Use gate without touching the Windows-internal descriptor", () => {
   const source = [
     "var Ye=`browser-use`,Xe=`chrome-internal`,Ze=`computer-use`,Qe=`latex-tectonic`;",

@@ -27,6 +27,15 @@ function findIconAsset(extractedDir) {
 const keybindsSettingsAsset = "keybinds-settings-linux.js";
 const linuxKeybindOverridesKey = "codex-linux-keybind-overrides";
 
+// Lookback/lookahead windows used when searching for the nearest minified
+// identifier or surrounding context around a regex anchor in the bundle.
+// Sized empirically to the typical distance between a feature's anchor and
+// the helper aliases it depends on.
+const TRAY_GUARD_LOOKAHEAD = 1200;
+const CLOSE_GATE_PREFIX_LOOKBACK = 8000;
+const HANDLER_PREFIX_LOOKBACK = 12000;
+const DIRECT_HANDLER_PROXIMITY = 1200;
+
 const linuxSettingsKeys = {
   promptWindow: "codex-linux-prompt-window-enabled",
   systemTray: "codex-linux-system-tray-enabled",
@@ -704,7 +713,7 @@ function applyLinuxTrayPatch(currentSource, iconPathExpression) {
     // Already patched.
   } else if (
     trayGuardIndex !== -1 &&
-    patchedSource.slice(trayGuardIndex, trayGuardIndex + 1200).includes("new n.Tray")
+    patchedSource.slice(trayGuardIndex, trayGuardIndex + TRAY_GUARD_LOOKAHEAD).includes("new n.Tray")
   ) {
     patchedSource = patchedSource.replace(trayGuardNeedle, trayGuardPatch);
   } else {
@@ -908,18 +917,22 @@ function parseDestructuredParamAliases(paramsText) {
   return aliases;
 }
 
-function buildComputerUseGate({ nameVar, featuresVar, platformVar, migrateVar }) {
-  return `{installWhenMissing:!0,name:${nameVar},isEnabled:({features:${featuresVar},platform:${platformVar}})=>(${platformVar}===\`darwin\`||${platformVar}===\`linux\`)&&${featuresVar}.computerUse,migrate:${migrateVar}}`;
+function buildComputerUseGate({ nameExpr, featuresVar, platformVar, migrateVar }) {
+  return `{installWhenMissing:!0,name:${nameExpr},isEnabled:({features:${featuresVar},platform:${platformVar}})=>(${platformVar}===\`darwin\`||${platformVar}===\`linux\`)&&${featuresVar}.computerUse,migrate:${migrateVar}}`;
 }
 
 function applyLinuxComputerUsePluginGatePatch(currentSource) {
+  if (!currentSource.includes("`computer-use`")) {
+    return currentSource;
+  }
+
   const computerUseNameVar = currentSource.match(/([A-Za-z_$][\w$]*)=`computer-use`/)?.[1] ?? null;
   const gateRegex =
-    /\{(installWhenMissing:!0,)?name:([A-Za-z_$][\w$]*),isEnabled:\(\{([^}]*)\}\)=>([^{}]*?\.computerUse),migrate:([A-Za-z_$][\w$]*)\}/g;
+    /\{(installWhenMissing:!0,)?name:([A-Za-z_$][\w$]*|`computer-use`),isEnabled:\(\{([^}]*)\}\)=>([^{}]*?\.computerUse),migrate:([A-Za-z_$][\w$]*)\}/g;
   let match;
   while ((match = gateRegex.exec(currentSource)) != null) {
-    const [gateSource, installWhenMissing, nameVar, paramsText, expression, migrateVar] = match;
-    if (computerUseNameVar != null && nameVar !== computerUseNameVar) {
+    const [gateSource, installWhenMissing, nameExpr, paramsText, expression, migrateVar] = match;
+    if (nameExpr !== "`computer-use`" && nameExpr !== computerUseNameVar) {
       continue;
     }
 
@@ -936,7 +949,7 @@ function applyLinuxComputerUsePluginGatePatch(currentSource) {
       return currentSource;
     }
     if (expression === darwinOnlyExpression || expression === linuxExpression) {
-      const replacement = buildComputerUseGate({ nameVar, featuresVar, platformVar, migrateVar });
+      const replacement = buildComputerUseGate({ nameExpr, featuresVar, platformVar, migrateVar });
       return `${currentSource.slice(0, match.index)}${replacement}${currentSource.slice(match.index + gateSource.length)}`;
     }
   }
@@ -994,7 +1007,10 @@ function applyLinuxTrayCloseSettingPatch(currentSource) {
   const closeGateMatch = patchedSource.match(closeGateRegex);
   if (closeGateMatch != null) {
     const [, trayReadyVar, disposableVar] = closeGateMatch;
-    const prefix = patchedSource.slice(Math.max(0, closeGateMatch.index - 8000), closeGateMatch.index);
+    const prefix = patchedSource.slice(
+      Math.max(0, closeGateMatch.index - CLOSE_GATE_PREFIX_LOOKBACK),
+      closeGateMatch.index,
+    );
     const globalStateExpr = findLinuxGlobalStateExpression(prefix);
     if (globalStateExpr != null) {
       return patchedSource.replace(
@@ -1110,12 +1126,10 @@ function applySemanticLinuxLaunchActionArgsPatch(currentSource) {
   let match;
   while ((match = handlerRegex.exec(currentSource)) != null) {
     const [, setterVar, deepLinksVar, fallbackFn, openerFn] = match;
-    const openerLetIndex = currentSource.indexOf(`let ${openerFn}=async(e,t)=>{`, match.index);
-    if (openerLetIndex === -1) {
-      continue;
-    }
-
-    const openerBraceIndex = openerLetIndex + `let ${openerFn}=async(e,t)=>`.length;
+    // handlerRegex ends with `let <openerFn>=async(e,t)=>{`, so the opening
+    // brace's position is determined directly by the match.
+    const openerBraceIndex = match.index + match[0].length - 1;
+    const openerLetIndex = openerBraceIndex - `let ${openerFn}=async(e,t)=>`.length;
     const openerEnd = findMatchingBrace(currentSource, openerBraceIndex);
     if (openerEnd === -1) {
       continue;
@@ -1141,7 +1155,7 @@ function applySemanticLinuxLaunchActionArgsPatch(currentSource) {
       continue;
     }
 
-    const prefix = currentSource.slice(Math.max(0, match.index - 12000), match.index);
+    const prefix = currentSource.slice(Math.max(0, match.index - HANDLER_PREFIX_LOOKBACK), match.index);
     const globalStateExpr = findLinuxGlobalStateExpression(prefix);
     const reporterVar = findLastRegexMatch(
       prefix,
@@ -1159,7 +1173,7 @@ function applySemanticLinuxLaunchActionArgsPatch(currentSource) {
     let replaceStart = match.index;
     let appVar = null;
     const directStart = currentSource.lastIndexOf("let codexLinuxSecondInstanceHandler=", match.index);
-    if (directStart !== -1 && match.index - directStart < 1200) {
+    if (directStart !== -1 && match.index - directStart < DIRECT_HANDLER_PROXIMITY) {
       const directBlock = currentSource.slice(directStart, match.index);
       const appMatch = directBlock.match(/([A-Za-z_$][\w$]*)\.app\.on\(`second-instance`,codexLinuxSecondInstanceHandler\)/);
       if (appMatch != null) {
@@ -1255,11 +1269,8 @@ function applyLinuxLaunchActionArgsPatch(currentSource) {
     return patchedSource;
   }
 
-  const semanticLaunchActionPatch = applySemanticLinuxLaunchActionArgsPatch(patchedSource);
-  if (semanticLaunchActionPatch !== patchedSource) {
-    return semanticLaunchActionPatch;
-  }
-
+  // Try cheap exact-string legacy needles first; only fall through to the
+  // semantic regex+capture pass if no known shape matches.
   if (patchedSource.includes(oldLaunchActionPatch)) {
     patchedSource = patchedSource.replace(oldLaunchActionPatch, launchActionPatch);
   } else if (patchedSource.includes(deepLinkFirstLaunchActionPatch)) {
@@ -1277,6 +1288,11 @@ function applyLinuxLaunchActionArgsPatch(currentSource) {
   } else if (patchedSource.includes(launchActionNeedle)) {
     patchedSource = patchedSource.replace(launchActionNeedle, launchActionPatch);
   } else {
+    const semanticLaunchActionPatch = applySemanticLinuxLaunchActionArgsPatch(patchedSource);
+    if (semanticLaunchActionPatch !== patchedSource) {
+      return semanticLaunchActionPatch;
+    }
+
     const existingLinuxLaunchActionBlock = patchedSource.match(
       /let ae=async\(e,t\)=>\{P\.hotkeyWindowLifecycleManager\.hide\(\);.*?;let oe=async\(\)=>\{/,
     )?.[0];

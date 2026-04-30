@@ -57,7 +57,8 @@ The easiest setup path is:
 bash scripts/install-deps.sh
 ```
 
-That helper detects `apt`, `dnf5`, `dnf`, or `pacman`, installs system packages, and bootstraps Rust through `rustup` if needed.
+That helper detects `apt`, `dnf5`, `dnf`, `pacman`, or `zypper`, installs system packages, and bootstraps Rust through `rustup` if needed.
+On apt-based systems, it uses a compatible distro `nodejs`/`npm` candidate when available and otherwise bootstraps Node.js 22 from NodeSource. Set `NODEJS_MAJOR=24` if you want to bootstrap Node.js 24 instead.
 The generated launcher can then auto-install `@openai/codex` on first run if the CLI is still missing and `npm` is available.
 
 If you prefer to preinstall the CLI manually:
@@ -74,7 +75,21 @@ If your system does not allow global npm installs, a rootless alternative also w
 npm i -g --prefix ~/.local @openai/codex
 ```
 
-### Ubuntu / Pop!_OS Note
+### Debian / Ubuntu / Pop!_OS Notes
+
+Ubuntu 22.04, Ubuntu 24.04, Debian 12, and related distros can provide stock `nodejs` packages below the Node.js 20+ requirement. Prefer:
+
+```bash
+bash scripts/install-deps.sh
+```
+
+The helper uses a compatible distro `nodejs`/`npm` candidate when available. If the current toolchain is missing or incompatible and the distro candidate is too old, it installs Node.js 22 from NodeSource. To bootstrap another maintained line:
+
+```bash
+NODEJS_MAJOR=24 bash scripts/install-deps.sh
+```
+
+If you install dependencies manually on Debian or Ubuntu, install Node.js 20+ with `npm` and `npx` from NodeSource, `nvm`, or another compatible source before running `./install.sh`. Do not rely on plain distro `apt install nodejs npm` unless your configured repositories provide Node.js 20 or newer.
 
 Ubuntu-family `p7zip-full` can be too old to extract newer APFS DMGs.
 Run `bash scripts/install-deps.sh` to install dependencies and bootstrap a newer `7zz`
@@ -242,6 +257,8 @@ echo 'alias codex-desktop="~/codex-desktop-linux/codex-app/start.sh"' >> ~/.bash
 The repository can build a Debian, RPM, or pacman package from the generated `codex-app/` directory.
 
 **Prerequisite:** Run `make build-app` (or `./install.sh`) first to produce `codex-app/`. The packaging scripts only repackage what is already there — they do not download or extract the DMG themselves.
+
+Native packages declare a Node.js 20+ runtime/build dependency because the installed update manager rebuilds future packages locally. On Debian and Ubuntu, run `bash scripts/install-deps.sh` or configure a compatible Node.js repository before installing the `.deb`; vanilla Ubuntu 22.04, Ubuntu 24.04, and Debian 12 repositories do not satisfy that dependency.
 
 ### Debian
 

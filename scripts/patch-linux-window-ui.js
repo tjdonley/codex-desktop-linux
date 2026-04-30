@@ -742,11 +742,13 @@ function applyLinuxTrayPatch(currentSource, iconPathExpression) {
     "if(process.platform===`win32`&&f===`local`&&!this.isAppQuitting&&this.options.canHideLastLocalWindowToTray?.()===!0&&!t){e.preventDefault(),k.hide();return}";
   const closeToTrayPatch =
     "if((process.platform===`win32`||process.platform===`linux`)&&f===`local`&&!this.isAppQuitting&&this.options.canHideLastLocalWindowToTray?.()===!0&&!t){e.preventDefault(),k.hide();return}";
+  const patchedCloseToTrayRegex =
+    /if\(\(process\.platform===`win32`\|\|process\.platform===`linux`\)&&[A-Za-z_$][\w$]*===`local`&&!this\.isAppQuitting&&this\.options\.canHideLastLocalWindowToTray\?\.\(\)===!0&&![A-Za-z_$][\w$]*\)\{[A-Za-z_$][\w$]*\.preventDefault\(\),[A-Za-z_$][\w$]*\.hide\(\);return\}/;
   if (patchedSource.includes(closeToTrayPatch)) {
     // Already patched.
   } else if (patchedSource.includes(closeToTrayNeedle)) {
     patchedSource = patchedSource.replace(closeToTrayNeedle, closeToTrayPatch);
-  } else if (/\(process\.platform===`win32`\|\|process\.platform===`linux`\)&&[A-Za-z_$][\w$]*===`local`/.test(patchedSource)) {
+  } else if (patchedCloseToTrayRegex.test(patchedSource)) {
     // Already patched with a newer minifier's window variable.
   } else {
     const closeToTrayRegex =

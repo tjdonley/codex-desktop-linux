@@ -169,6 +169,20 @@ test("adds Linux tray support for current minified window and startup identifier
   assert.match(patched, /\(E\|\|process\.platform===`linux`&&codexLinuxIsTrayEnabled\(\)\)&&ce\$\(\);/);
 });
 
+test("scopes close-to-tray already-patched detection to the handler", () => {
+  const source = [
+    "let unrelated=(process.platform===`win32`||process.platform===`linux`)&&x===`local`;",
+    "v&&j.on(`close`,e=>{this.persistPrimaryWindowBounds(j,f);let t=this.getPrimaryWindows(f).some(e=>e!==j);if(process.platform===`win32`&&f===`local`&&!this.isAppQuitting&&this.options.canHideLastLocalWindowToTray?.()===!0&&!t){e.preventDefault(),j.hide();return}});",
+  ].join("");
+
+  const patched = applyPatchTwice(applyLinuxTrayPatch, source, null);
+
+  assert.match(
+    patched,
+    /if\(\(process\.platform===`win32`\|\|process\.platform===`linux`\)&&f===`local`&&!this\.isAppQuitting&&this\.options\.canHideLastLocalWindowToTray\?\.\(\)===!0&&!t\)\{e\.preventDefault\(\),j\.hide\(\);return\}/,
+  );
+});
+
 test("adds Linux single-instance lock and second-instance handoff", () => {
   const patched = applyPatchTwice(applyLinuxSingleInstancePatch, singleInstanceBundleFixture());
 

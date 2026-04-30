@@ -925,18 +925,26 @@ function buildComputerUseGate({ nameExpr, featuresVar, platformVar, migrateVar }
   return `{installWhenMissing:!0,name:${nameExpr},isEnabled:({features:${featuresVar},platform:${platformVar}})=>(${platformVar}===\`darwin\`||${platformVar}===\`linux\`)&&${featuresVar}.computerUse,migrate:${migrateVar}}`;
 }
 
+function hasComputerUseLiteral(source) {
+  return /(?:`computer-use`|"computer-use"|'computer-use')/.test(source);
+}
+
+function isComputerUseNameExpr(nameExpr, computerUseNameVar) {
+  return /^(?:`computer-use`|"computer-use"|'computer-use')$/.test(nameExpr) || nameExpr === computerUseNameVar;
+}
+
 function applyLinuxComputerUsePluginGatePatch(currentSource) {
-  if (!currentSource.includes("`computer-use`")) {
+  if (!hasComputerUseLiteral(currentSource)) {
     return currentSource;
   }
 
-  const computerUseNameVar = currentSource.match(/([A-Za-z_$][\w$]*)=`computer-use`/)?.[1] ?? null;
+  const computerUseNameVar = currentSource.match(/([A-Za-z_$][\w$]*)=(?:`computer-use`|"computer-use"|'computer-use')/)?.[1] ?? null;
   const gateRegex =
-    /\{(installWhenMissing:!0,)?name:([A-Za-z_$][\w$]*|`computer-use`),isEnabled:\(\{([^}]*)\}\)=>([^{}]*?\.computerUse),migrate:([A-Za-z_$][\w$]*)\}/g;
+    /\{(installWhenMissing:!0,)?name:([A-Za-z_$][\w$]*|`computer-use`|"computer-use"|'computer-use'),isEnabled:\(\{([^}]*)\}\)=>([^{}]*?\.computerUse),migrate:([A-Za-z_$][\w$]*)\}/g;
   let match;
   while ((match = gateRegex.exec(currentSource)) != null) {
     const [gateSource, installWhenMissing, nameExpr, paramsText, expression, migrateVar] = match;
-    if (nameExpr !== "`computer-use`" && nameExpr !== computerUseNameVar) {
+    if (!isComputerUseNameExpr(nameExpr, computerUseNameVar)) {
       continue;
     }
 
@@ -958,7 +966,7 @@ function applyLinuxComputerUsePluginGatePatch(currentSource) {
     }
   }
 
-  if (currentSource.includes("`computer-use`") && currentSource.includes("computerUse")) {
+  if (hasComputerUseLiteral(currentSource) && currentSource.includes("computerUse")) {
     throw new Error("Required Linux Computer Use plugin gate patch failed: could not enable bundled Computer Use on Linux");
   }
 
@@ -998,11 +1006,10 @@ function applyBrowserAnnotationScreenshotPatch(currentSource) {
 function applyLinuxTrayCloseSettingPatch(currentSource) {
   let patchedSource = currentSource;
 
-  if (
-    patchedSource.includes("canHideLastLocalWindowToTray:()=>") &&
-    patchedSource.includes("process.platform!==`linux`||") &&
-    patchedSource.includes(linuxSettingsKeys.systemTray)
-  ) {
+  const patchedCloseGateRegex = new RegExp(
+    `canHideLastLocalWindowToTray:\\(\\)=>[A-Za-z_$][\\w$]*&&\\(process\\.platform!==\`linux\`\\|\\|[^,{}]+\\.get\\(\`${escapeRegExp(linuxSettingsKeys.systemTray)}\`\\)!==!1\\),disposables:[A-Za-z_$][\\w$]*`,
+  );
+  if (patchedCloseGateRegex.test(patchedSource)) {
     return patchedSource;
   }
 

@@ -233,6 +233,22 @@ test("gates current close-to-tray setting through the captured global state", ()
   assert.doesNotMatch(patched, /M\.globalState\.get/);
 });
 
+test("does not treat unrelated Linux setting references as close-to-tray patched", () => {
+  const source = [
+    "let j=KD({moduleDir:__dirname});",
+    "let M=FM({buildFlavor:a,globalState:j.globalState,canHideLastLocalWindowToTray:()=>O,disposables:k});",
+    "let codexLinuxGetSetting=e=>process.platform!==`linux`||j.globalState.get(`codex-linux-system-tray-enabled`)!==!1;",
+    "t.Mr().info(`Launching app`);",
+  ].join("");
+
+  const patched = applyPatchTwice(applyLinuxTrayCloseSettingPatch, source);
+
+  assert.match(
+    patched,
+    /canHideLastLocalWindowToTray:\(\)=>O&&\(process\.platform!==`linux`\|\|j\.globalState\.get\(`codex-linux-system-tray-enabled`\)!==!1\),disposables:k/,
+  );
+});
+
 test("allows bundled Computer Use on Linux as well as macOS", () => {
   const patched = applyPatchTwice(
     applyLinuxComputerUsePluginGatePatch,
@@ -290,6 +306,22 @@ test("targets literal Computer Use gate names without patching unrelated descrip
     patched,
     /name:`computer-use`,isEnabled:\(\{features:e,platform:t\}\)=>\(t===`darwin`\|\|t===`linux`\)&&e\.computerUse,migrate:wn/,
   );
+});
+
+test("handles quoted Computer Use gate names", () => {
+  const boundNameSource = [
+    "var tn=\"computer-use\";",
+    "var $n=[{name:tn,isEnabled:({features:e,platform:t})=>t===`darwin`&&e.computerUse,migrate:wn}];",
+  ].join("");
+  const literalNameSource = "var $n=[{name:'computer-use',isEnabled:({platform:t,features:e})=>t===`darwin`&&e.computerUse,migrate:wn}];";
+
+  const patchedBoundName = applyPatchTwice(applyLinuxComputerUsePluginGatePatch, boundNameSource);
+  const patchedLiteralName = applyPatchTwice(applyLinuxComputerUsePluginGatePatch, literalNameSource);
+
+  assert.match(patchedBoundName, /installWhenMissing:!0,name:tn/);
+  assert.match(patchedBoundName, /\(t===`darwin`\|\|t===`linux`\)&&e\.computerUse/);
+  assert.match(patchedLiteralName, /installWhenMissing:!0,name:'computer-use'/);
+  assert.match(patchedLiteralName, /\(t===`darwin`\|\|t===`linux`\)&&e\.computerUse/);
 });
 
 test("patches the current Computer Use gate without touching the Windows-internal descriptor", () => {

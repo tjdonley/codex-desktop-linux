@@ -1,8 +1,20 @@
 use crate::atspi_tree::{
-    list_accessible_apps, snapshot_tree, AccessibilityNode, AccessibleAppSummary,
+    list_accessible_apps, perform_action as invoke_accessibility_action, set_element_value,
+    snapshot_tree, AccessibilityAction, AccessibilityNode, AccessibleAppSummary, Bounds,
+    ValueSetInvocation,
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
+use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
+use crate::remote_desktop::{
+    click as portal_click, drag as portal_drag, scroll as portal_scroll,
+    start_portal_pointer_session, PointerButton, PortalPointerSession, ScrollDirection,
+};
 use crate::screenshot::{capture_screenshot, ScreenshotCapture};
+use crate::windows::{
+    focus_window_target, focused_window, list_windows, resolve_window_target,
+    window_permission_hint, WindowFocusResult, WindowInfo, WindowTarget,
+    GNOME_SHELL_EXTENSION_BACKEND, GNOME_SHELL_INTROSPECT_BACKEND, HYPRLAND_BACKEND, KWIN_BACKEND,
+};
 use anyhow::Result;
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
@@ -15,12 +27,14 @@ use std::{
     path::PathBuf,
     process::{Command, Output},
     sync::{Arc, Mutex},
+    thread,
+    time::Duration,
 };
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ComputerUseLinux {
     last_nodes: Arc<Mutex<Vec<AccessibilityNode>>>,
-    last_screenshot_size: Arc<Mutex<Option<ScreenSize>>>,
+    portal_pointer_session: Arc<Mutex<Option<PortalPointerSession>>>,
 }
 
 #[tool_router]
@@ -42,6 +56,14 @@ impl ComputerUseLinux {
     }
 
     #[tool(
+        name = "setup_window_targeting",
+        description = "Install and enable the optional GNOME Shell extension used for exact window list/focus targeting when GNOME blocks native introspection."
+    )]
+    async fn setup_window_targeting(&self) -> Json<WindowTargetingSetupReport> {
+        Json(setup_window_targeting_report().await)
+    }
+
+    #[tool(
         name = "list_apps",
         description = "List running Linux desktop app candidates visible to the Computer Use backend."
     )]
@@ -60,6 +82,83 @@ impl ComputerUseLinux {
     }
 
     #[tool(
+        name = "list_windows",
+        description = "List compositor windows with title, app id, class, focus state, client type, and known bounds."
+    )]
+    async fn list_windows(&self) -> Json<ListWindowsOutput> {
+        Json(window_list_output().await)
+    }
+
+    #[tool(
+        name = "focused_window",
+        description = "Return the compositor window that currently has keyboard focus."
+    )]
+    async fn focused_window(&self) -> Json<FocusedWindowOutput> {
+        match focused_window().await {
+            Ok(window) => {
+                let backend = window_backend(window.as_ref().into_iter());
+                Json(FocusedWindowOutput {
+                    backend,
+                    focused_window: window,
+                    error: None,
+                    permissions_hint: None,
+                    message:
+                        "Focused window query completed through the available compositor window backend."
+                            .to_string(),
+                })
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                Json(FocusedWindowOutput {
+                    backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
+                    focused_window: None,
+                    permissions_hint: window_permission_hint(&error),
+                    error: Some(error),
+                    message: "Focused window query failed; targeted keyboard input is unavailable until window introspection works.".to_string(),
+                })
+            }
+        }
+    }
+
+    #[tool(
+        name = "activate_window",
+        description = "Focus a Linux desktop window by window_id, pid, app_id, wm_class, title, or terminal selectors when the compositor permits it."
+    )]
+    async fn activate_window(
+        &self,
+        Parameters(params): Parameters<ActivateWindowParams>,
+    ) -> Json<ActivateWindowOutput> {
+        let target = params.into_target();
+        let received = Some(serde_json::json!(target.clone()));
+        match focus_window_target(&target).await {
+            Ok(focus) => {
+                let ok = focus_satisfies_target(&focus, &target);
+                Json(ActivateWindowOutput {
+                    ok,
+                    implemented: true,
+                    backend: focus.backend.clone(),
+                    focus: Some(focus),
+                    error: None,
+                    permissions_hint: None,
+                    received,
+                })
+            }
+            Err(error) => {
+                let error = format!("{error:#}");
+                Json(ActivateWindowOutput {
+                    ok: false,
+                    implemented: true,
+                    backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
+                    focus: None,
+                    permissions_hint: window_permission_hint(&error),
+                    error: Some(error),
+                    received,
+                })
+            }
+        }
+    }
+
+    #[tool(
         name = "get_app_state",
         description = "Start an app use session if needed, then get screenshot and accessibility state for a Linux app."
     )]
@@ -68,72 +167,86 @@ impl ComputerUseLinux {
         Parameters(params): Parameters<GetAppStateParams>,
     ) -> Json<GetAppStateOutput> {
         let diagnostics = doctor_report();
+        let (window_context, window_error, window_permissions_hint) =
+            self.resolve_window_context(&params).await;
         let max_nodes = params.max_nodes.unwrap_or(120).clamp(1, 500);
         let max_depth = params.max_depth.unwrap_or(12).min(12);
         let include_screenshot = params.include_screenshot.unwrap_or(true);
+        let app_filter = self
+            .resolve_accessibility_app_filter(&params, window_context.as_ref())
+            .await;
         let (screenshot, screenshot_error) = if include_screenshot {
             match capture_screenshot().await {
-                Ok(capture) => {
-                    self.cache_screenshot_size(capture.width, capture.height);
-                    (Some(capture), None)
-                }
-                Err(error) => {
-                    self.clear_screenshot_size();
-                    (None, Some(error.to_string()))
-                }
+                Ok(capture) => (Some(capture), None),
+                Err(error) => (None, Some(error.to_string())),
             }
         } else {
-            self.clear_screenshot_size();
             (None, None)
         };
-        let (accessibility_tree, accessibility_error) =
+        let (accessibility_tree, accessibility_tree_raw_count, accessibility_error) =
             if diagnostics.readiness.can_build_accessibility_tree {
-                match snapshot_tree(
-                    params.app_name_or_bundle_identifier.as_deref(),
-                    max_nodes,
-                    max_depth,
-                )
-                .await
-                {
-                    Ok(nodes) => (nodes, None),
-                    Err(error) => (Vec::new(), Some(error.to_string())),
+                let target_pid = window_context.as_ref().and_then(|window| window.pid);
+                match snapshot_tree(app_filter.as_deref(), target_pid, max_nodes, max_depth).await {
+                    Ok(nodes) => {
+                        let raw_count = nodes.len();
+                        (compact_accessibility_tree(nodes), raw_count, None)
+                    }
+                    Err(error) => (Vec::new(), 0, Some(error.to_string())),
                 }
             } else {
                 (
                     Vec::new(),
+                    0,
                     Some(
                         "GNOME accessibility is disabled; call setup_accessibility first."
                             .to_string(),
                     ),
                 )
             };
-        self.cache_nodes(&accessibility_tree);
-        let message = if let Some(error) = &accessibility_error {
+        if accessibility_error.is_none() {
+            self.cache_nodes(&accessibility_tree);
+        }
+        let mut message = if let Some(error) = &accessibility_error {
             format!("MCP registration is working, but AT-SPI tree extraction failed: {error}")
         } else if let Some(capture) = &screenshot {
             format!(
-                "MCP registration, screenshot capture, and AT-SPI tree extraction are working. Captured {} accessibility nodes and a screenshot through {}.",
+                "MCP registration, screenshot capture, and AT-SPI tree extraction are working. Captured {} accessibility nodes (compacted from {}) and a screenshot through {}.",
                 accessibility_tree.len(),
+                accessibility_tree_raw_count,
                 capture.source
             )
         } else if let Some(error) = &screenshot_error {
             format!(
-                "MCP registration and AT-SPI tree extraction are working. Captured {} accessibility nodes. Screenshot capture failed: {error}",
-                accessibility_tree.len()
+                "MCP registration and AT-SPI tree extraction are working. Captured {} accessibility nodes (compacted from {}). Screenshot capture failed: {error}",
+                accessibility_tree.len(),
+                accessibility_tree_raw_count,
             )
         } else {
             format!(
-                "MCP registration and AT-SPI tree extraction are working. Captured {} accessibility nodes. Screenshot capture was not requested.",
-                accessibility_tree.len()
+                "MCP registration and AT-SPI tree extraction are working. Captured {} accessibility nodes (compacted from {}). Screenshot capture was not requested.",
+                accessibility_tree.len(),
+                accessibility_tree_raw_count,
             )
         };
+        if let Some(window) = &window_context {
+            message.push_str(&format!(
+                " Window target resolved to window_id {}.",
+                window.window_id
+            ));
+        } else if let Some(error) = &window_error {
+            message.push_str(&format!(" Window target resolution failed: {error}"));
+        }
 
         Json(GetAppStateOutput {
             app_name_or_bundle_identifier: params.app_name_or_bundle_identifier,
+            window_context,
+            window_error,
+            window_permissions_hint,
             backend: "linux-atspi".to_string(),
             screenshot,
             screenshot_error,
             accessibility_tree,
+            accessibility_tree_raw_count,
             accessibility_error,
             diagnostics,
             message,
@@ -142,12 +255,12 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "click",
-        description = "Click an element by index or pixel coordinates from screenshot."
+        description = "Click an element by index, semantic selector, or pixel coordinates from screenshot."
     )]
-    fn click(&self, Parameters(params): Parameters<ClickParams>) -> Json<ActionOutput> {
+    async fn click(&self, Parameters(params): Parameters<ClickParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
-        let (x, y) = match self.resolve_target_point(params.x, params.y, params.element_index) {
-            Ok(point) => point,
+        let target = match self.resolve_click_target(&params) {
+            Ok(target) => target,
             Err(message) => {
                 return Json(ActionOutput {
                     ok: false,
@@ -158,9 +271,98 @@ impl ComputerUseLinux {
                 });
             }
         };
+        if let ClickTarget::PrimaryAction {
+            object_ref,
+            action_name,
+        } = target
+        {
+            return match invoke_accessibility_action(&object_ref, Some("0")).await {
+                Ok(invocation) => Json(ActionOutput {
+                    ok: invocation.ok,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: if invocation.ok {
+                        format!(
+                            "No clickable bounds were cached, so I invoked the primary AT-SPI action{}.",
+                            action_name
+                                .as_deref()
+                                .filter(|name| !name.is_empty())
+                                .map(|name| format!(" ({name})"))
+                                .unwrap_or_default()
+                        )
+                    } else {
+                        format!(
+                            "The primary AT-SPI action{} returned false.",
+                            action_name
+                                .as_deref()
+                                .filter(|name| !name.is_empty())
+                                .map(|name| format!(" ({name})"))
+                                .unwrap_or_default()
+                        )
+                    },
+                    received,
+                }),
+                Err(error) => Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "click".to_string(),
+                    message: error.to_string(),
+                    received,
+                }),
+            };
+        }
+        let ClickTarget::Coordinates(x, y) = target else {
+            unreachable!("click target must resolve to coordinates or an AT-SPI action");
+        };
         let button = mouse_button_code(params.button.as_deref());
         let click_count = params.click_count.unwrap_or(1).clamp(1, 10).to_string();
-        let (x, y) = self.to_ydotool_absolute_point(x, y);
+        if let Some(session) = self.cached_portal_pointer_session() {
+            match portal_click(
+                &session,
+                x,
+                y,
+                PointerButton::from_name(params.button.as_deref()),
+                params.click_count.unwrap_or(1).clamp(1, 10),
+            )
+            .await
+            {
+                Ok(()) => {
+                    return Json(ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "click".to_string(),
+                        message: "Action sent through the remote desktop portal.".to_string(),
+                        received,
+                    });
+                }
+                Err(_) => self.clear_portal_pointer_session(),
+            }
+        } else if self.should_prefer_portal_pointer_backend() {
+            match self.ensure_portal_pointer_session().await {
+                Ok(Some(session)) => match portal_click(
+                    &session,
+                    x,
+                    y,
+                    PointerButton::from_name(params.button.as_deref()),
+                    params.click_count.unwrap_or(1).clamp(1, 10),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        return Json(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "click".to_string(),
+                            message: "Action sent through the remote desktop portal.".to_string(),
+                            received,
+                        });
+                    }
+                    Err(_) => self.clear_portal_pointer_session(),
+                },
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
         let result = run_ydotool_sequence(&[
             absolute_mousemove_args(x, y),
             vec![
@@ -174,37 +376,74 @@ impl ComputerUseLinux {
     }
 
     #[tool(
-        name = "perform_secondary_action",
-        description = "Invoke a secondary accessibility action exposed by an element."
+        name = "perform_action",
+        description = "Invoke an accessibility action exposed by an element selected by index, identifier, or semantic selector. Defaults to the primary action unless action is provided."
     )]
-    fn perform_secondary_action(
+    async fn perform_action(
         &self,
-        Parameters(params): Parameters<SecondaryActionParams>,
+        Parameters(params): Parameters<ActionParams>,
     ) -> Json<ActionOutput> {
-        Json(not_implemented(
-            "perform_secondary_action",
-            Some(serde_json::json!(params)),
-            "AT-SPI secondary actions need the element action cache and are not wired yet.",
-        ))
+        self.perform_element_action(&params, params.action.as_deref().or(Some("0")))
+            .await
     }
 
     #[tool(
         name = "set_value",
-        description = "Set the value of a settable accessibility element."
+        description = "Set the value of a settable accessibility element selected by index, identifier, or semantic selector."
     )]
-    fn set_value(&self, Parameters(params): Parameters<SetValueParams>) -> Json<ActionOutput> {
-        Json(not_implemented(
-            "set_value",
-            Some(serde_json::json!(params)),
-            "AT-SPI value setting needs the element value cache and is not wired yet.",
-        ))
+    async fn set_value(
+        &self,
+        Parameters(params): Parameters<SetValueParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let object_ref = match self.resolve_object_ref(
+            params.element_index,
+            params.element_identifier.as_deref(),
+            &params.selector(),
+            ElementResolvePurpose::SetValue,
+        ) {
+            Ok(object_ref) => object_ref,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "set_value".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
+
+        match set_element_value(&object_ref, &params.value).await {
+            Ok(ValueSetInvocation::Numeric { value }) => Json(ActionOutput {
+                ok: true,
+                implemented: true,
+                action: "set_value".to_string(),
+                message: format!("AT-SPI numeric value set to {value}."),
+                received,
+            }),
+            Ok(ValueSetInvocation::EditableText) => Json(ActionOutput {
+                ok: true,
+                implemented: true,
+                action: "set_value".to_string(),
+                message: "AT-SPI editable text contents set.".to_string(),
+                received,
+            }),
+            Err(error) => Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "set_value".to_string(),
+                message: error.to_string(),
+                received,
+            }),
+        }
     }
 
     #[tool(
         name = "scroll",
         description = "Scroll an element in a direction by a number of pages."
     )]
-    fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> Json<ActionOutput> {
+    async fn scroll(&self, Parameters(params): Parameters<ScrollParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
         let units = ((params.pages.unwrap_or(1.0).abs().max(0.1) * 5.0).round() as i32).max(1);
         let target_point =
@@ -220,6 +459,55 @@ impl ComputerUseLinux {
                     });
                 }
             };
+        let direction = match params.direction.to_ascii_lowercase().as_str() {
+            "up" => ScrollDirection::Up,
+            "down" => ScrollDirection::Down,
+            "left" => ScrollDirection::Left,
+            "right" => ScrollDirection::Right,
+            _ => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "scroll".to_string(),
+                    message: "Unsupported scroll direction; expected up, down, left, or right."
+                        .to_string(),
+                    received,
+                });
+            }
+        };
+        if let Some(session) = self.cached_portal_pointer_session() {
+            match portal_scroll(&session, target_point, direction, units).await {
+                Ok(()) => {
+                    return Json(ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "scroll".to_string(),
+                        message: "Action sent through the remote desktop portal.".to_string(),
+                        received,
+                    });
+                }
+                Err(_) => self.clear_portal_pointer_session(),
+            }
+        } else if self.should_prefer_portal_pointer_backend() {
+            match self.ensure_portal_pointer_session().await {
+                Ok(Some(session)) => match portal_scroll(&session, target_point, direction, units)
+                    .await
+                {
+                    Ok(()) => {
+                        return Json(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "scroll".to_string(),
+                            message: "Action sent through the remote desktop portal.".to_string(),
+                            received,
+                        });
+                    }
+                    Err(_) => self.clear_portal_pointer_session(),
+                },
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
         let (dx, dy) = match params.direction.to_ascii_lowercase().as_str() {
             "up" => (0, units),
             "down" => (0, -units),
@@ -238,7 +526,6 @@ impl ComputerUseLinux {
         };
         let mut sequence = Vec::new();
         if let Some((x, y)) = target_point {
-            let (x, y) = self.to_ydotool_absolute_point(x, y);
             sequence.push(absolute_mousemove_args(x, y));
         }
         sequence.push(wheel_mousemove_args(dx, dy));
@@ -250,14 +537,59 @@ impl ComputerUseLinux {
         name = "drag",
         description = "Drag from one point to another using pixel coordinates."
     )]
-    fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
+    async fn drag(&self, Parameters(params): Parameters<DragParams>) -> Json<ActionOutput> {
         let received = Some(serde_json::json!(params));
-        let (start_x, start_y) = self.to_ydotool_absolute_point(params.start_x, params.start_y);
-        let (end_x, end_y) = self.to_ydotool_absolute_point(params.end_x, params.end_y);
+        if let Some(session) = self.cached_portal_pointer_session() {
+            match portal_drag(
+                &session,
+                params.start_x,
+                params.start_y,
+                params.end_x,
+                params.end_y,
+            )
+            .await
+            {
+                Ok(()) => {
+                    return Json(ActionOutput {
+                        ok: true,
+                        implemented: true,
+                        action: "drag".to_string(),
+                        message: "Action sent through the remote desktop portal.".to_string(),
+                        received,
+                    });
+                }
+                Err(_) => self.clear_portal_pointer_session(),
+            }
+        } else if self.should_prefer_portal_pointer_backend() {
+            match self.ensure_portal_pointer_session().await {
+                Ok(Some(session)) => match portal_drag(
+                    &session,
+                    params.start_x,
+                    params.start_y,
+                    params.end_x,
+                    params.end_y,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        return Json(ActionOutput {
+                            ok: true,
+                            implemented: true,
+                            action: "drag".to_string(),
+                            message: "Action sent through the remote desktop portal.".to_string(),
+                            received,
+                        });
+                    }
+                    Err(_) => self.clear_portal_pointer_session(),
+                },
+                Ok(None) => {}
+                Err(_) => {}
+            }
+        }
         let result = run_ydotool_sequence(&[
-            absolute_mousemove_args(start_x, start_y),
+            absolute_mousemove_args(params.start_x, params.start_y),
             vec!["click".to_string(), "0x40".to_string()],
-            absolute_mousemove_args(end_x, end_y),
+            absolute_mousemove_args(params.end_x, params.end_y),
             vec!["click".to_string(), "0x80".to_string()],
         ]);
         Json(action_result("drag", result, received))
@@ -265,10 +597,25 @@ impl ComputerUseLinux {
 
     #[tool(
         name = "press_key",
-        description = "Press a key or key-combination on the keyboard, including modifier and navigation keys."
+        description = "Press a key or key-combination on the keyboard, optionally after focusing a target window or terminal selector."
     )]
-    fn press_key(&self, Parameters(params): Parameters<PressKeyParams>) -> Json<ActionOutput> {
-        let received = Some(serde_json::json!(params));
+    async fn press_key(
+        &self,
+        Parameters(params): Parameters<PressKeyParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let focus = match self.focus_target_for_input(&params.window_target()).await {
+            Ok(focus) => focus,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "press_key".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
         let Some(key_events) = key_sequence(&params.key) else {
             return Json(ActionOutput {
                 ok: false,
@@ -281,25 +628,50 @@ impl ComputerUseLinux {
         let mut args = vec!["key".to_string()];
         args.extend(key_events);
         let result = run_ydotool(&args).map(|output| vec![output]);
-        Json(action_result("press_key", result, received))
+        Json(action_result_with_focus(
+            "press_key",
+            result,
+            received,
+            focus,
+        ))
     }
 
     #[tool(
         name = "type_text",
-        description = "Type literal text using keyboard input."
+        description = "Type literal text using keyboard input, optionally after focusing a target window or terminal selector."
     )]
-    fn type_text(&self, Parameters(params): Parameters<TypeTextParams>) -> Json<ActionOutput> {
-        let received = Some(serde_json::json!(params));
+    async fn type_text(
+        &self,
+        Parameters(params): Parameters<TypeTextParams>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let focus = match self.focus_target_for_input(&params.window_target()).await {
+            Ok(focus) => focus,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "type_text".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
         let result = run_ydotool(&["type".to_string(), "--".to_string(), params.text])
             .map(|output| vec![output]);
-        Json(action_result("type_text", result, received))
+        Json(action_result_with_focus(
+            "type_text",
+            result,
+            received,
+            focus,
+        ))
     }
 }
 
 #[tool_handler(
     name = "codex-computer-use-linux",
     version = "0.1.0",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. This Linux backend can capture screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees, and send coordinate, element-index click/scroll, key, text, and drag input through ydotool when ydotoold is available. Native AT-SPI actions are still in progress."
+    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through GNOME Shell, KWin/Plasma, or Hyprland when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, and send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available or through ydotool otherwise. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified."
 )]
 impl ServerHandler for ComputerUseLinux {}
 
@@ -321,6 +693,73 @@ struct ListAppsOutput {
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ListWindowsOutput {
+    backend: String,
+    windows: Vec<WindowInfo>,
+    error: Option<String>,
+    permissions_hint: Option<String>,
+    note: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct FocusedWindowOutput {
+    backend: String,
+    focused_window: Option<WindowInfo>,
+    error: Option<String>,
+    permissions_hint: Option<String>,
+    message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+struct ActivateWindowParams {
+    #[serde(default)]
+    window_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    tty: Option<String>,
+    #[serde(default)]
+    terminal_pid: Option<u32>,
+    #[serde(default)]
+    terminal_command: Option<String>,
+    #[serde(default)]
+    terminal_cwd: Option<String>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    wm_class: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+impl ActivateWindowParams {
+    fn into_target(self) -> WindowTarget {
+        WindowTarget {
+            window_id: self.window_id,
+            pid: self.pid,
+            tty: self.tty,
+            terminal_pid: self.terminal_pid,
+            terminal_command: self.terminal_command,
+            terminal_cwd: self.terminal_cwd,
+            app_id: self.app_id,
+            wm_class: self.wm_class,
+            title: self.title,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ActivateWindowOutput {
+    ok: bool,
+    implemented: bool,
+    backend: String,
+    focus: Option<WindowFocusResult>,
+    error: Option<String>,
+    permissions_hint: Option<String>,
+    received: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 struct AppCandidate {
     name: String,
     pid: u32,
@@ -332,6 +771,24 @@ struct GetAppStateParams {
     #[serde(default)]
     app_name_or_bundle_identifier: Option<String>,
     #[serde(default)]
+    window_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    tty: Option<String>,
+    #[serde(default)]
+    terminal_pid: Option<u32>,
+    #[serde(default)]
+    terminal_command: Option<String>,
+    #[serde(default)]
+    terminal_cwd: Option<String>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    wm_class: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     max_nodes: Option<usize>,
     #[serde(default)]
     max_depth: Option<u32>,
@@ -339,22 +796,50 @@ struct GetAppStateParams {
     include_screenshot: Option<bool>,
 }
 
+impl GetAppStateParams {
+    fn window_target(&self) -> WindowTarget {
+        WindowTarget {
+            window_id: self.window_id,
+            pid: self.pid,
+            tty: self.tty.clone(),
+            terminal_pid: self.terminal_pid,
+            terminal_command: self.terminal_command.clone(),
+            terminal_cwd: self.terminal_cwd.clone(),
+            app_id: self.app_id.clone(),
+            wm_class: self.wm_class.clone(),
+            title: self.title.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct GetAppStateOutput {
     app_name_or_bundle_identifier: Option<String>,
+    window_context: Option<WindowInfo>,
+    window_error: Option<String>,
+    window_permissions_hint: Option<String>,
     backend: String,
     screenshot: Option<ScreenshotCapture>,
     screenshot_error: Option<String>,
     accessibility_tree: Vec<AccessibilityNode>,
+    accessibility_tree_raw_count: usize,
     accessibility_error: Option<String>,
     diagnostics: DoctorReport,
     message: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct ClickParams {
     #[serde(default)]
     element_index: Option<u32>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    states: Vec<String>,
     #[serde(default)]
     x: Option<i32>,
     #[serde(default)]
@@ -365,23 +850,72 @@ struct ClickParams {
     click_count: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-struct SecondaryActionParams {
+impl ClickParams {
+    fn selector(&self) -> ElementSelector<'_> {
+        ElementSelector {
+            role: self.role.as_deref(),
+            name: self.name.as_deref(),
+            text: self.text.as_deref(),
+            states: &self.states,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+struct ActionParams {
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
     element_identifier: Option<String>,
     #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    states: Vec<String>,
+    #[serde(default)]
     action: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+impl ActionParams {
+    fn selector(&self) -> ElementSelector<'_> {
+        ElementSelector {
+            role: self.role.as_deref(),
+            name: self.name.as_deref(),
+            text: self.text.as_deref(),
+            states: &self.states,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 struct SetValueParams {
     #[serde(default)]
     element_index: Option<u32>,
     #[serde(default)]
     element_identifier: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    states: Vec<String>,
     value: String,
+}
+
+impl SetValueParams {
+    fn selector(&self) -> ElementSelector<'_> {
+        ElementSelector {
+            role: self.role.as_deref(),
+            name: self.name.as_deref(),
+            text: self.text.as_deref(),
+            states: &self.states,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -408,17 +942,79 @@ struct DragParams {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct PressKeyParams {
     key: String,
+    #[serde(default)]
+    window_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    tty: Option<String>,
+    #[serde(default)]
+    terminal_pid: Option<u32>,
+    #[serde(default)]
+    terminal_command: Option<String>,
+    #[serde(default)]
+    terminal_cwd: Option<String>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    wm_class: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 struct TypeTextParams {
     text: String,
+    #[serde(default)]
+    window_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    tty: Option<String>,
+    #[serde(default)]
+    terminal_pid: Option<u32>,
+    #[serde(default)]
+    terminal_command: Option<String>,
+    #[serde(default)]
+    terminal_cwd: Option<String>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    wm_class: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ScreenSize {
-    width: u32,
-    height: u32,
+impl PressKeyParams {
+    fn window_target(&self) -> WindowTarget {
+        WindowTarget {
+            window_id: self.window_id,
+            pid: self.pid,
+            tty: self.tty.clone(),
+            terminal_pid: self.terminal_pid,
+            terminal_command: self.terminal_command.clone(),
+            terminal_cwd: self.terminal_cwd.clone(),
+            app_id: self.app_id.clone(),
+            wm_class: self.wm_class.clone(),
+            title: self.title.clone(),
+        }
+    }
+}
+
+impl TypeTextParams {
+    fn window_target(&self) -> WindowTarget {
+        WindowTarget {
+            window_id: self.window_id,
+            pid: self.pid,
+            tty: self.tty.clone(),
+            terminal_pid: self.terminal_pid,
+            terminal_command: self.terminal_command.clone(),
+            terminal_cwd: self.terminal_cwd.clone(),
+            app_id: self.app_id.clone(),
+            wm_class: self.wm_class.clone(),
+            title: self.title.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -430,70 +1026,130 @@ struct ActionOutput {
     received: Option<serde_json::Value>,
 }
 
-fn not_implemented(
-    action: &str,
-    received: Option<serde_json::Value>,
-    message: &str,
-) -> ActionOutput {
-    ActionOutput {
-        ok: false,
-        implemented: false,
-        action: action.to_string(),
-        message: message.to_string(),
-        received,
-    }
-}
-
 impl ComputerUseLinux {
+    fn should_prefer_portal_pointer_backend(&self) -> bool {
+        env::var("CODEX_COMPUTER_USE_FORCE_YDOTOOL_POINTER")
+            .ok()
+            .as_deref()
+            != Some("1")
+            && env::var("XDG_SESSION_TYPE")
+                .ok()
+                .is_some_and(|value| value.eq_ignore_ascii_case("wayland"))
+    }
+
+    fn cached_portal_pointer_session(&self) -> Option<PortalPointerSession> {
+        self.portal_pointer_session
+            .lock()
+            .ok()
+            .and_then(|cached| cached.clone())
+    }
+
+    fn clear_portal_pointer_session(&self) {
+        if let Ok(mut cached) = self.portal_pointer_session.lock() {
+            *cached = None;
+        }
+    }
+
+    async fn ensure_portal_pointer_session(&self) -> Result<Option<PortalPointerSession>> {
+        if !self.should_prefer_portal_pointer_backend() {
+            return Ok(None);
+        }
+        if let Some(session) = self.cached_portal_pointer_session() {
+            return Ok(Some(session));
+        }
+
+        let session = start_portal_pointer_session().await?;
+        if let Ok(mut cached) = self.portal_pointer_session.lock() {
+            *cached = Some(session.clone());
+        }
+        Ok(Some(session))
+    }
+
+    async fn resolve_window_context(
+        &self,
+        params: &GetAppStateParams,
+    ) -> (Option<WindowInfo>, Option<String>, Option<String>) {
+        let target = params.window_target();
+        if !target.has_target() {
+            return (None, None, None);
+        }
+
+        match list_windows().await {
+            Ok(windows) => match resolve_window_target(&windows, &target) {
+                Ok(window) => (Some(window.clone()), None, None),
+                Err(error) => (None, Some(format!("{error:#}")), None),
+            },
+            Err(error) => {
+                let error = format!("{error:#}");
+                let hint = window_permission_hint(&error);
+                (None, Some(error), hint)
+            }
+        }
+    }
+
+    async fn resolve_accessibility_app_filter(
+        &self,
+        params: &GetAppStateParams,
+        window_context: Option<&WindowInfo>,
+    ) -> Option<String> {
+        if let Some(explicit) = trimmed_nonempty(params.app_name_or_bundle_identifier.as_deref()) {
+            return Some(explicit.to_string());
+        }
+
+        let target_pid = window_context.and_then(|window| window.pid).or(params.pid);
+        let candidates = accessibility_filter_candidates(window_context);
+
+        if let Some(target_pid) = target_pid {
+            if let Ok(apps) = list_accessible_apps(200).await {
+                if let Some(object_ref) =
+                    select_accessibility_object_ref(&apps, target_pid, &candidates)
+                {
+                    return Some(object_ref);
+                }
+            }
+        }
+
+        candidates.into_iter().next()
+    }
+
+    async fn focus_target_for_input(
+        &self,
+        target: &WindowTarget,
+    ) -> std::result::Result<Option<WindowFocusResult>, String> {
+        if !target.has_target() {
+            return Ok(None);
+        }
+
+        let focus = focus_window_target(target).await.map_err(|error| {
+            let error = format!("{error:#}");
+            if let Some(hint) = window_permission_hint(&error) {
+                format!("Did not send input because the target window could not be focused: {error}. {hint}")
+            } else {
+                format!("Did not send input because the target window could not be focused: {error}")
+            }
+        })?;
+
+        if focus_satisfies_target(&focus, target) {
+            Ok(Some(focus))
+        } else {
+            let required = if target.requires_exact_focus() {
+                "exact target-window focus"
+            } else {
+                "app-level focus"
+            };
+            Err(format!(
+                "Did not send input because {required} verification failed after activating the target window. Focus result: requested window_id {}, focused window_id {:?}.",
+                focus.requested_window.window_id,
+                focus.focused_window.as_ref().map(|window| window.window_id)
+            ))
+        }
+    }
+
     fn cache_nodes(&self, nodes: &[AccessibilityNode]) {
         if let Ok(mut cached) = self.last_nodes.lock() {
             cached.clear();
             cached.extend_from_slice(nodes);
         }
-    }
-
-    fn cache_screenshot_size(&self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            self.clear_screenshot_size();
-            return;
-        }
-        if let Ok(mut cached) = self.last_screenshot_size.lock() {
-            *cached = Some(ScreenSize { width, height });
-        }
-    }
-
-    fn clear_screenshot_size(&self) {
-        if let Ok(mut cached) = self.last_screenshot_size.lock() {
-            *cached = None;
-        }
-    }
-
-    fn to_ydotool_absolute_point(&self, x: i32, y: i32) -> (i32, i32) {
-        let Some(size) = self
-            .last_screenshot_size
-            .lock()
-            .ok()
-            .and_then(|cached| *cached)
-        else {
-            return (x, y);
-        };
-        (
-            pixel_to_ydotool_absolute(x, size.width),
-            pixel_to_ydotool_absolute(y, size.height),
-        )
-    }
-
-    fn resolve_target_point(
-        &self,
-        x: Option<i32>,
-        y: Option<i32>,
-        element_index: Option<u32>,
-    ) -> std::result::Result<(i32, i32), String> {
-        self.resolve_optional_target_point(x, y, element_index)?
-            .ok_or_else(|| {
-                "Pass x/y coordinates or an element_index from the latest get_app_state result."
-                    .to_string()
-            })
     }
 
     fn resolve_optional_target_point(
@@ -516,25 +1172,555 @@ impl ComputerUseLinux {
         }
     }
 
+    fn resolve_click_target(
+        &self,
+        params: &ClickParams,
+    ) -> std::result::Result<ClickTarget, String> {
+        if let Some((x, y)) = params.x.zip(params.y) {
+            return Ok(ClickTarget::Coordinates(x, y));
+        }
+
+        let selector = params.selector();
+        let node = self.resolve_cached_node(
+            params.element_index,
+            &selector,
+            ElementResolvePurpose::Click,
+        )?;
+
+        if let Some((x, y)) = node.bounds.as_ref().and_then(bounds_center) {
+            return Ok(ClickTarget::Coordinates(x, y));
+        }
+
+        if !is_plain_left_click(params.button.as_deref(), params.click_count) {
+            return Err(format!(
+                "No clickable bounds cached for element_index {}. Call get_app_state first and choose a node with positive width and height.",
+                node.index
+            ));
+        }
+
+        let Some(action_name) = primary_action_name(node.actions.as_slice()) else {
+            return Err(format!(
+                "No clickable bounds cached for element_index {}, and the element exposes no primary AT-SPI action.",
+                node.index
+            ));
+        };
+        Ok(ClickTarget::PrimaryAction {
+            object_ref: node.object_ref.clone(),
+            action_name: Some(action_name),
+        })
+    }
+
     fn center_for_cached_node(&self, element_index: u32) -> Option<(i32, i32)> {
         let cached = self.last_nodes.lock().ok()?;
         let node = cached.iter().find(|node| node.index == element_index)?;
-        let bounds = node.bounds.as_ref()?;
-        if bounds.width <= 0 || bounds.height <= 0 {
-            return None;
+        bounds_center(node.bounds.as_ref()?)
+    }
+
+    fn resolve_object_ref(
+        &self,
+        element_index: Option<u32>,
+        element_identifier: Option<&str>,
+        selector: &ElementSelector<'_>,
+        purpose: ElementResolvePurpose,
+    ) -> std::result::Result<String, String> {
+        if let Some(element_identifier) = element_identifier
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Ok(element_identifier.to_string());
         }
-        Some((bounds.x + bounds.width / 2, bounds.y + bounds.height / 2))
+
+        self.resolve_cached_node(element_index, selector, purpose)
+            .map(|node| node.object_ref)
+    }
+
+    fn resolve_cached_node(
+        &self,
+        element_index: Option<u32>,
+        selector: &ElementSelector<'_>,
+        purpose: ElementResolvePurpose,
+    ) -> std::result::Result<AccessibilityNode, String> {
+        let cached = self.last_nodes.lock().map_err(|_| {
+            "Could not read cached accessibility nodes. Call get_app_state and retry.".to_string()
+        })?;
+
+        if let Some(element_index) = element_index {
+            return cached
+                .iter()
+                .find(|node| node.index == element_index)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "No cached accessibility node for element_index {element_index}. Call get_app_state first."
+                    )
+                });
+        }
+
+        if selector.is_empty() {
+            return Err(
+                "Pass element_index, element_identifier, or a semantic selector such as role/name/text/states from the latest get_app_state result."
+                    .to_string(),
+            );
+        }
+
+        resolve_semantic_node(cached.as_slice(), selector, purpose)
+    }
+
+    async fn perform_element_action(
+        &self,
+        params: &ActionParams,
+        requested_action: Option<&str>,
+    ) -> Json<ActionOutput> {
+        let received = Some(serde_json::json!(params.clone()));
+        let object_ref = match self.resolve_object_ref(
+            params.element_index,
+            params.element_identifier.as_deref(),
+            &params.selector(),
+            ElementResolvePurpose::Action,
+        ) {
+            Ok(object_ref) => object_ref,
+            Err(message) => {
+                return Json(ActionOutput {
+                    ok: false,
+                    implemented: true,
+                    action: "perform_action".to_string(),
+                    message,
+                    received,
+                });
+            }
+        };
+
+        match invoke_accessibility_action(&object_ref, requested_action).await {
+            Ok(invocation) => Json(ActionOutput {
+                ok: invocation.ok,
+                implemented: true,
+                action: "perform_action".to_string(),
+                message: if invocation.ok {
+                    format!(
+                        "AT-SPI action {} ({}) invoked.",
+                        invocation.action_index,
+                        invocation
+                            .action_name
+                            .as_deref()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("unnamed")
+                    )
+                } else {
+                    format!(
+                        "AT-SPI action {} ({}) returned false.",
+                        invocation.action_index,
+                        invocation
+                            .action_name
+                            .as_deref()
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("unnamed")
+                    )
+                },
+                received,
+            }),
+            Err(error) => Json(ActionOutput {
+                ok: false,
+                implemented: true,
+                action: "perform_action".to_string(),
+                message: error.to_string(),
+                received,
+            }),
+        }
     }
 }
 
-fn pixel_to_ydotool_absolute(value: i32, extent: u32) -> i32 {
-    if extent <= 1 {
-        return value;
+#[derive(Debug)]
+enum ClickTarget {
+    Coordinates(i32, i32),
+    PrimaryAction {
+        object_ref: String,
+        action_name: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ElementResolvePurpose {
+    Click,
+    Action,
+    SetValue,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ElementSelector<'a> {
+    role: Option<&'a str>,
+    name: Option<&'a str>,
+    text: Option<&'a str>,
+    states: &'a [String],
+}
+
+impl ElementSelector<'_> {
+    fn is_empty(&self) -> bool {
+        [self.role, self.name, self.text]
+            .into_iter()
+            .all(|value| value.map(str::trim).is_none_or(str::is_empty))
+            && self.states.iter().all(|value| value.trim().is_empty())
     }
-    let max_pixel = extent as i32 - 1;
-    let clamped = value.clamp(0, max_pixel) as i64;
-    let max_pixel = max_pixel as i64;
-    ((clamped * 65_535 + max_pixel / 2) / max_pixel) as i32
+}
+
+fn resolve_semantic_node(
+    nodes: &[AccessibilityNode],
+    selector: &ElementSelector<'_>,
+    purpose: ElementResolvePurpose,
+) -> std::result::Result<AccessibilityNode, String> {
+    let mut matches = nodes
+        .iter()
+        .filter(|node| node_matches_selector(node, selector))
+        .collect::<Vec<_>>();
+
+    if matches.is_empty() {
+        return Err(format!(
+            "No cached accessibility node matched semantic selector {}. Call get_app_state first or pass element_index.",
+            describe_selector(selector)
+        ));
+    }
+
+    if let Some(node) =
+        unique_preferred_node(&matches, |node| node_matches_resolve_purpose(node, purpose))
+    {
+        return Ok(node.clone());
+    }
+
+    let useful_matches = matches
+        .iter()
+        .copied()
+        .filter(|node| node_matches_resolve_purpose(node, purpose))
+        .collect::<Vec<_>>();
+    if !useful_matches.is_empty() {
+        matches = useful_matches;
+    }
+
+    if let Some(node) = unique_preferred_node(&matches, node_is_showing) {
+        return Ok(node.clone());
+    }
+
+    let visible_matches = matches
+        .iter()
+        .copied()
+        .filter(|node| node_is_showing(node))
+        .collect::<Vec<_>>();
+    if !visible_matches.is_empty() {
+        matches = visible_matches;
+    }
+
+    if matches.len() == 1 {
+        return Ok(matches[0].clone());
+    }
+
+    Err(format!(
+        "Semantic selector {} matched multiple cached nodes: {}. Pass element_index or add more selector fields.",
+        describe_selector(selector),
+        describe_matching_nodes(&matches),
+    ))
+}
+
+fn unique_preferred_node<'a>(
+    nodes: &[&'a AccessibilityNode],
+    predicate: impl Fn(&AccessibilityNode) -> bool,
+) -> Option<&'a AccessibilityNode> {
+    let mut matches = nodes.iter().copied().filter(|node| predicate(node));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn node_matches_selector(node: &AccessibilityNode, selector: &ElementSelector<'_>) -> bool {
+    selector
+        .role
+        .is_none_or(|role| normalized_contains(Some(node.role.as_str()), role))
+        && selector
+            .name
+            .is_none_or(|name| normalized_contains(node.name.as_deref(), name))
+        && selector.text.is_none_or(|text| {
+            normalized_contains(
+                node.text
+                    .as_ref()
+                    .and_then(|value| value.content.as_deref()),
+                text,
+            ) || normalized_contains(node.name.as_deref(), text)
+                || normalized_contains(node.description.as_deref(), text)
+        })
+        && selector
+            .states
+            .iter()
+            .filter(|state| !state.trim().is_empty())
+            .all(|state| {
+                node.states
+                    .iter()
+                    .any(|node_state| normalized_equals(node_state, state))
+            })
+}
+
+fn node_matches_resolve_purpose(node: &AccessibilityNode, purpose: ElementResolvePurpose) -> bool {
+    match purpose {
+        ElementResolvePurpose::Click => {
+            node.bounds.as_ref().and_then(bounds_center).is_some()
+                || primary_action_name(&node.actions).is_some()
+        }
+        ElementResolvePurpose::Action => !node.actions.is_empty(),
+        ElementResolvePurpose::SetValue => node.supports_editable_text || node.value.is_some(),
+    }
+}
+
+fn node_is_showing(node: &AccessibilityNode) -> bool {
+    node.states
+        .iter()
+        .any(|state| normalized_equals(state, "showing"))
+        && node
+            .states
+            .iter()
+            .any(|state| normalized_equals(state, "visible"))
+}
+
+fn normalized_equals(actual: &str, expected: &str) -> bool {
+    normalize_text(actual) == normalize_text(expected)
+}
+
+fn normalized_contains(actual: Option<&str>, expected: &str) -> bool {
+    let expected = normalize_text(expected);
+    !expected.is_empty()
+        && actual
+            .map(normalize_text)
+            .is_some_and(|actual| actual.contains(&expected))
+}
+
+fn normalize_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn describe_selector(selector: &ElementSelector<'_>) -> String {
+    let mut parts = Vec::new();
+    if let Some(role) = selector.role.map(str::trim).filter(|role| !role.is_empty()) {
+        parts.push(format!("role={role:?}"));
+    }
+    if let Some(name) = selector.name.map(str::trim).filter(|name| !name.is_empty()) {
+        parts.push(format!("name={name:?}"));
+    }
+    if let Some(text) = selector.text.map(str::trim).filter(|text| !text.is_empty()) {
+        parts.push(format!("text={text:?}"));
+    }
+    let states = selector
+        .states
+        .iter()
+        .map(|state| state.trim())
+        .filter(|state| !state.is_empty())
+        .collect::<Vec<_>>();
+    if !states.is_empty() {
+        parts.push(format!("states={states:?}"));
+    }
+    if parts.is_empty() {
+        "<empty>".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn describe_matching_nodes(nodes: &[&AccessibilityNode]) -> String {
+    nodes
+        .iter()
+        .take(8)
+        .map(|node| {
+            format!(
+                "element_index {} role={:?} name={:?}",
+                node.index, node.role, node.name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn is_plain_left_click(button: Option<&str>, click_count: Option<u32>) -> bool {
+    let button = button.unwrap_or("left");
+    let click_count = click_count.unwrap_or(1);
+    matches!(button.to_ascii_lowercase().as_str(), "left" | "primary") && click_count == 1
+}
+
+fn primary_action_name(actions: &[AccessibilityAction]) -> Option<String> {
+    actions.first().map(|action| action.name.clone())
+}
+
+fn bounds_center(bounds: &Bounds) -> Option<(i32, i32)> {
+    if bounds.width <= 0 || bounds.height <= 0 {
+        return None;
+    }
+    if bounds.x <= i32::MIN / 2 || bounds.y <= i32::MIN / 2 {
+        return None;
+    }
+    Some((
+        bounds.x.checked_add(bounds.width / 2)?,
+        bounds.y.checked_add(bounds.height / 2)?,
+    ))
+}
+
+fn compact_accessibility_tree(nodes: Vec<AccessibilityNode>) -> Vec<AccessibilityNode> {
+    if nodes.is_empty() {
+        return nodes;
+    }
+
+    let keep = nodes
+        .iter()
+        .map(should_keep_accessibility_node)
+        .collect::<Vec<_>>();
+    let mut old_to_new = vec![None; nodes.len()];
+    let mut compacted = Vec::new();
+
+    for (old_index, node) in nodes.iter().enumerate() {
+        if !keep[old_index] {
+            continue;
+        }
+
+        let mut compacted_node = node.clone();
+        compacted_node.index = compacted.len() as u32;
+        compacted_node.parent_index = nearest_kept_parent(&keep, &nodes, old_index);
+        old_to_new[old_index] = Some(compacted_node.index);
+        compacted.push(compacted_node);
+    }
+
+    for node in &mut compacted {
+        node.parent_index = node
+            .parent_index
+            .and_then(|old_parent| old_to_new.get(old_parent as usize).copied().flatten());
+    }
+
+    let child_counts = compacted.iter().filter_map(|node| node.parent_index).fold(
+        vec![0_i32; compacted.len()],
+        |mut counts, parent_index| {
+            counts[parent_index as usize] += 1;
+            counts
+        },
+    );
+
+    for (index, node) in compacted.iter_mut().enumerate() {
+        node.child_count = child_counts[index];
+    }
+
+    compacted
+}
+
+fn nearest_kept_parent(
+    keep: &[bool],
+    nodes: &[AccessibilityNode],
+    old_index: usize,
+) -> Option<u32> {
+    let mut parent = nodes[old_index].parent_index;
+    while let Some(parent_index) = parent {
+        let parent_usize = parent_index as usize;
+        if keep.get(parent_usize).copied().unwrap_or(false) {
+            return Some(parent_index);
+        }
+        parent = nodes.get(parent_usize).and_then(|node| node.parent_index);
+    }
+    None
+}
+
+fn should_keep_accessibility_node(node: &AccessibilityNode) -> bool {
+    if node.depth <= 1 {
+        return true;
+    }
+
+    if is_actionable_accessibility_node(node) || has_meaningful_node_copy(node) {
+        return true;
+    }
+
+    matches!(
+        node.role.as_str(),
+        "page tab" | "menu item" | "menu" | "list item" | "tree item"
+    ) && !is_sentinel_or_missing_bounds(node.bounds.as_ref())
+}
+
+fn is_actionable_accessibility_node(node: &AccessibilityNode) -> bool {
+    !node.actions.is_empty() || node.supports_editable_text || node.value.is_some()
+}
+
+fn has_meaningful_node_copy(node: &AccessibilityNode) -> bool {
+    has_non_empty_text(node.name.as_deref())
+        || has_non_empty_text(node.description.as_deref())
+        || has_non_empty_text(node.text.as_ref().and_then(|text| text.content.as_deref()))
+}
+
+fn has_non_empty_text(value: Option<&str>) -> bool {
+    value.map(str::trim).is_some_and(|value| !value.is_empty())
+}
+
+fn is_sentinel_or_missing_bounds(bounds: Option<&Bounds>) -> bool {
+    bounds.is_none()
+}
+
+fn select_accessibility_object_ref(
+    apps: &[AccessibleAppSummary],
+    target_pid: u32,
+    candidates: &[String],
+) -> Option<String> {
+    let mut pid_matches = apps.iter().filter(|app| app.pid == Some(target_pid));
+    let first = pid_matches.next()?;
+    let second = pid_matches.next();
+
+    if second.is_none() {
+        return Some(first.object_ref.clone());
+    }
+
+    let lowered_candidates = candidates
+        .iter()
+        .map(|candidate| candidate.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    apps.iter()
+        .filter(|app| app.pid == Some(target_pid))
+        .find(|app| {
+            let name = app.name.as_deref().unwrap_or_default().to_ascii_lowercase();
+            lowered_candidates
+                .iter()
+                .any(|candidate| !candidate.is_empty() && name.contains(candidate))
+        })
+        .map(|app| app.object_ref.clone())
+        .or_else(|| Some(first.object_ref.clone()))
+}
+
+fn accessibility_filter_candidates(window_context: Option<&WindowInfo>) -> Vec<String> {
+    let Some(window) = window_context else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    push_candidate(&mut candidates, window.title.as_deref());
+    push_candidate(&mut candidates, window.wm_class.as_deref());
+
+    if let Some(app_id) = trimmed_nonempty(window.app_id.as_deref()) {
+        if !app_id.starts_with("window:") {
+            push_candidate(&mut candidates, Some(app_id));
+            if let Some(stripped) = app_id.strip_suffix(".desktop") {
+                push_candidate(&mut candidates, Some(stripped));
+                let normalized = stripped.replace(['-', '_', '.'], " ");
+                push_candidate(&mut candidates, Some(normalized.as_str()));
+            } else {
+                let normalized = app_id.replace(['-', '_', '.'], " ");
+                push_candidate(&mut candidates, Some(normalized.as_str()));
+            }
+        }
+    }
+
+    candidates
+}
+
+fn push_candidate(candidates: &mut Vec<String>, value: Option<&str>) {
+    let Some(value) = trimmed_nonempty(value) else {
+        return;
+    };
+
+    if !candidates.iter().any(|candidate| candidate == value) {
+        candidates.push(value.to_string());
+    }
+}
+
+fn trimmed_nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn action_result(
@@ -560,6 +1746,79 @@ fn action_result(
     }
 }
 
+fn action_result_with_focus(
+    action: &str,
+    result: std::result::Result<Vec<Output>, String>,
+    received: Option<serde_json::Value>,
+    focus: Option<WindowFocusResult>,
+) -> ActionOutput {
+    let mut output = action_result(action, result, received);
+    if output.ok {
+        if let Some(focus) = focus {
+            let verification = if focus.exact_window_focused {
+                "exact window-focus"
+            } else {
+                "app-level focus"
+            };
+            output.message = format!(
+                "{} Target window_id {} was focused with {verification} verification before input.",
+                output.message, focus.requested_window.window_id,
+            );
+        }
+    }
+    output
+}
+
+fn focus_satisfies_target(focus: &WindowFocusResult, target: &WindowTarget) -> bool {
+    if target.requires_exact_focus() {
+        focus.exact_window_focused
+    } else {
+        focus.exact_window_focused || focus.app_focused
+    }
+}
+
+async fn window_list_output() -> ListWindowsOutput {
+    match list_windows().await {
+        Ok(windows) => {
+            let backend = window_backend(windows.iter());
+            let note = if backend == GNOME_SHELL_EXTENSION_BACKEND {
+                "Window list came from the Codex GNOME Shell extension. Terminal windows may include best-effort PTY and active-process context when the process tree is readable."
+            } else if backend == KWIN_BACKEND {
+                "Window list came from KWin/Plasma DBus scripting. Terminal windows may include best-effort PTY and active-process context when the process tree is readable."
+            } else if backend == HYPRLAND_BACKEND {
+                "Window list came from Hyprland hyprctl. Terminal windows may include best-effort PTY and active-process context when the process tree is readable."
+            } else {
+                "Window list came from GNOME Shell Introspect. Terminal windows may include best-effort PTY and active-process context when the process tree is readable."
+            };
+            ListWindowsOutput {
+                backend,
+                windows,
+                error: None,
+                permissions_hint: None,
+                note: note.to_string(),
+            }
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            ListWindowsOutput {
+                backend: GNOME_SHELL_INTROSPECT_BACKEND.to_string(),
+                windows: Vec::new(),
+                permissions_hint: window_permission_hint(&error),
+                error: Some(error),
+                note: "Window listing failed, so targeted keyboard input cannot safely focus or verify a target window."
+                    .to_string(),
+            }
+        }
+    }
+}
+
+fn window_backend<'a>(windows: impl Iterator<Item = &'a WindowInfo>) -> String {
+    windows
+        .map(|window| window.backend.clone())
+        .next()
+        .unwrap_or_else(|| GNOME_SHELL_INTROSPECT_BACKEND.to_string())
+}
+
 fn absolute_mousemove_args(x: i32, y: i32) -> Vec<String> {
     vec![
         "mousemove".to_string(),
@@ -582,8 +1841,11 @@ fn wheel_mousemove_args(dx: i32, dy: i32) -> Vec<String> {
 
 fn run_ydotool_sequence(commands: &[Vec<String>]) -> std::result::Result<Vec<Output>, String> {
     let mut outputs = Vec::new();
-    for args in commands {
+    for (index, args) in commands.iter().enumerate() {
         outputs.push(run_ydotool(args)?);
+        if index + 1 < commands.len() {
+            thread::sleep(Duration::from_millis(35));
+        }
     }
     Ok(outputs)
 }
@@ -829,9 +2091,18 @@ fn looks_like_desktop_app(name: &str, command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::atspi_tree::Bounds;
+    use crate::atspi_tree::{AccessibilityAction, Bounds};
+    use crate::windows::WindowBounds;
 
     fn node(index: u32, bounds: Option<Bounds>) -> AccessibilityNode {
+        node_with_actions(index, bounds, Vec::new())
+    }
+
+    fn node_with_actions(
+        index: u32,
+        bounds: Option<Bounds>,
+        actions: Vec<AccessibilityAction>,
+    ) -> AccessibilityNode {
         AccessibilityNode {
             index,
             parent_index: None,
@@ -842,7 +2113,269 @@ mod tests {
             description: None,
             child_count: 0,
             bounds,
+            states: Vec::new(),
+            actions,
+            value: None,
+            text: None,
+            supports_editable_text: false,
         }
+    }
+
+    fn click_action() -> AccessibilityAction {
+        AccessibilityAction {
+            index: 0,
+            name: "Click".to_string(),
+            description: "Clicks the element".to_string(),
+            keybinding: String::new(),
+        }
+    }
+
+    fn window_info(
+        window_id: u64,
+        title: Option<&str>,
+        app_id: Option<&str>,
+        wm_class: Option<&str>,
+        pid: Option<u32>,
+    ) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            title: title.map(str::to_string),
+            app_id: app_id.map(str::to_string),
+            wm_class: wm_class.map(str::to_string),
+            pid,
+            bounds: Some(WindowBounds {
+                x: Some(10),
+                y: Some(20),
+                width: 800,
+                height: 600,
+            }),
+            workspace: Some(0),
+            focused: false,
+            hidden: false,
+            client_type: Some("wayland".to_string()),
+            backend: GNOME_SHELL_EXTENSION_BACKEND.to_string(),
+            terminal: None,
+        }
+    }
+
+    #[test]
+    fn accessibility_filter_candidates_prefer_title_and_skip_synthetic_app_id() {
+        let window = window_info(
+            42,
+            Some("CU ATSPI GTK Test"),
+            Some("window:46"),
+            Some("cu_atspi_gtk_test.py"),
+            Some(2914326),
+        );
+
+        let candidates = accessibility_filter_candidates(Some(&window));
+
+        assert_eq!(
+            candidates,
+            vec![
+                "CU ATSPI GTK Test".to_string(),
+                "cu_atspi_gtk_test.py".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn select_accessibility_object_ref_prefers_exact_pid_match() {
+        let apps = vec![
+            AccessibleAppSummary {
+                object_ref: ":1.31/org/a11y/atspi/accessible/root".to_string(),
+                name: Some("electron".to_string()),
+                pid: Some(2774076),
+                role: "application".to_string(),
+                child_count: 1,
+                bounds: None,
+            },
+            AccessibleAppSummary {
+                object_ref: ":1.64/org/a11y/atspi/accessible/root".to_string(),
+                name: Some("cu_atspi_gtk_test.py".to_string()),
+                pid: Some(2914326),
+                role: "application".to_string(),
+                child_count: 1,
+                bounds: None,
+            },
+        ];
+
+        let object_ref = select_accessibility_object_ref(
+            &apps,
+            2914326,
+            &[
+                "CU ATSPI GTK Test".to_string(),
+                "cu_atspi_gtk_test.py".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(object_ref, ":1.64/org/a11y/atspi/accessible/root");
+    }
+
+    #[test]
+    fn compact_accessibility_tree_reparents_actionable_descendants() {
+        let nodes = vec![
+            AccessibilityNode {
+                index: 0,
+                parent_index: None,
+                depth: 0,
+                object_ref: ":1.0/root".to_string(),
+                role: "application".to_string(),
+                name: Some("demo-app".to_string()),
+                description: None,
+                child_count: 1,
+                bounds: None,
+                states: Vec::new(),
+                actions: Vec::new(),
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+            AccessibilityNode {
+                index: 1,
+                parent_index: Some(0),
+                depth: 1,
+                object_ref: ":1.1/frame".to_string(),
+                role: "frame".to_string(),
+                name: Some("Demo Frame".to_string()),
+                description: None,
+                child_count: 1,
+                bounds: None,
+                states: Vec::new(),
+                actions: Vec::new(),
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+            AccessibilityNode {
+                index: 2,
+                parent_index: Some(1),
+                depth: 2,
+                object_ref: ":1.2/filler".to_string(),
+                role: "filler".to_string(),
+                name: None,
+                description: None,
+                child_count: 1,
+                bounds: None,
+                states: Vec::new(),
+                actions: Vec::new(),
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+            AccessibilityNode {
+                index: 3,
+                parent_index: Some(2),
+                depth: 3,
+                object_ref: ":1.3/button".to_string(),
+                role: "button".to_string(),
+                name: Some("Run".to_string()),
+                description: None,
+                child_count: 0,
+                bounds: Some(Bounds {
+                    x: 10,
+                    y: 20,
+                    width: 100,
+                    height: 40,
+                }),
+                states: Vec::new(),
+                actions: vec![AccessibilityAction {
+                    index: 0,
+                    name: "Click".to_string(),
+                    description: "Clicks the button".to_string(),
+                    keybinding: String::new(),
+                }],
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+        ];
+
+        let compacted = compact_accessibility_tree(nodes);
+
+        assert_eq!(compacted.len(), 3);
+        assert_eq!(compacted[0].role, "application");
+        assert_eq!(compacted[1].role, "frame");
+        assert_eq!(compacted[2].role, "button");
+        assert_eq!(compacted[2].parent_index, Some(1));
+        assert_eq!(compacted[1].child_count, 1);
+    }
+
+    #[test]
+    fn compact_accessibility_tree_drops_structural_noise() {
+        let nodes = vec![
+            AccessibilityNode {
+                index: 0,
+                parent_index: None,
+                depth: 0,
+                object_ref: ":1.0/root".to_string(),
+                role: "application".to_string(),
+                name: Some("demo-app".to_string()),
+                description: None,
+                child_count: 2,
+                bounds: None,
+                states: Vec::new(),
+                actions: Vec::new(),
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+            AccessibilityNode {
+                index: 1,
+                parent_index: Some(0),
+                depth: 1,
+                object_ref: ":1.1/frame".to_string(),
+                role: "frame".to_string(),
+                name: Some("Demo Frame".to_string()),
+                description: None,
+                child_count: 2,
+                bounds: None,
+                states: Vec::new(),
+                actions: Vec::new(),
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+            AccessibilityNode {
+                index: 2,
+                parent_index: Some(1),
+                depth: 2,
+                object_ref: ":1.2/tab".to_string(),
+                role: "page tab".to_string(),
+                name: Some("Hidden".to_string()),
+                description: None,
+                child_count: 0,
+                bounds: None,
+                states: Vec::new(),
+                actions: Vec::new(),
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+            AccessibilityNode {
+                index: 3,
+                parent_index: Some(1),
+                depth: 2,
+                object_ref: ":1.3/separator".to_string(),
+                role: "separator".to_string(),
+                name: None,
+                description: None,
+                child_count: 0,
+                bounds: None,
+                states: Vec::new(),
+                actions: Vec::new(),
+                value: None,
+                text: None,
+                supports_editable_text: false,
+            },
+        ];
+
+        let compacted = compact_accessibility_tree(nodes);
+
+        assert_eq!(compacted.len(), 3);
+        assert_eq!(compacted[2].role, "page tab");
+        assert_eq!(compacted[2].name.as_deref(), Some("Hidden"));
     }
 
     #[test]
@@ -858,7 +2391,10 @@ mod tests {
             }),
         )]);
 
-        let point = backend.resolve_target_point(None, None, Some(7)).unwrap();
+        let point = backend
+            .resolve_optional_target_point(None, None, Some(7))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(point, (60, 40));
     }
@@ -877,7 +2413,8 @@ mod tests {
         )]);
 
         let point = backend
-            .resolve_target_point(Some(200), Some(300), Some(7))
+            .resolve_optional_target_point(Some(200), Some(300), Some(7))
+            .unwrap()
             .unwrap();
 
         assert_eq!(point, (200, 300));
@@ -897,7 +2434,27 @@ mod tests {
         )]);
 
         let error = backend
-            .resolve_target_point(None, None, Some(7))
+            .resolve_optional_target_point(None, None, Some(7))
+            .unwrap_err();
+
+        assert!(error.contains("No clickable bounds cached for element_index 7"));
+    }
+
+    #[test]
+    fn cached_element_index_ignores_sentinel_bounds() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node(
+            7,
+            Some(Bounds {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: 1,
+                height: 1,
+            }),
+        )]);
+
+        let error = backend
+            .resolve_optional_target_point(None, None, Some(7))
             .unwrap_err();
 
         assert!(error.contains("No clickable bounds cached for element_index 7"));
@@ -918,7 +2475,107 @@ mod tests {
         backend.cache_nodes(&[]);
 
         let error = backend
-            .resolve_target_point(None, None, Some(7))
+            .resolve_optional_target_point(None, None, Some(7))
+            .unwrap_err();
+
+        assert!(error.contains("No clickable bounds cached for element_index 7"));
+    }
+
+    #[test]
+    fn click_target_falls_back_to_primary_action_without_bounds() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            None,
+            vec![AccessibilityAction {
+                index: 0,
+                name: "Click".to_string(),
+                description: "Clicks the button".to_string(),
+                keybinding: String::new(),
+            }],
+        )]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                ..Default::default()
+            })
+            .unwrap();
+
+        match target {
+            ClickTarget::PrimaryAction {
+                object_ref,
+                action_name,
+            } => {
+                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+                assert_eq!(action_name.as_deref(), Some("Click"));
+            }
+            ClickTarget::Coordinates(_, _) => {
+                panic!("expected AT-SPI primary-action fallback")
+            }
+        }
+    }
+
+    #[test]
+    fn click_target_falls_back_to_primary_action_with_sentinel_bounds() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            Some(Bounds {
+                x: i32::MIN,
+                y: i32::MIN,
+                width: 1,
+                height: 1,
+            }),
+            vec![AccessibilityAction {
+                index: 0,
+                name: "Click".to_string(),
+                description: "Clicks the button".to_string(),
+                keybinding: String::new(),
+            }],
+        )]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                ..Default::default()
+            })
+            .unwrap();
+
+        match target {
+            ClickTarget::PrimaryAction {
+                object_ref,
+                action_name,
+            } => {
+                assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+                assert_eq!(action_name.as_deref(), Some("Click"));
+            }
+            ClickTarget::Coordinates(_, _) => {
+                panic!("expected AT-SPI primary-action fallback")
+            }
+        }
+    }
+
+    #[test]
+    fn click_target_requires_bounds_for_non_plain_clicks() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node_with_actions(
+            7,
+            None,
+            vec![AccessibilityAction {
+                index: 0,
+                name: "Click".to_string(),
+                description: "Clicks the button".to_string(),
+                keybinding: String::new(),
+            }],
+        )]);
+
+        let error = backend
+            .resolve_click_target(&ClickParams {
+                element_index: Some(7),
+                button: Some("right".to_string()),
+                ..Default::default()
+            })
             .unwrap_err();
 
         assert!(error.contains("No clickable bounds cached for element_index 7"));
@@ -953,26 +2610,17 @@ mod tests {
     }
 
     #[test]
-    fn screenshot_pixels_normalize_to_ydotool_absolute_space() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_screenshot_size(3840, 1080);
-
-        assert_eq!(backend.to_ydotool_absolute_point(1550, 930), (26460, 56485));
-    }
-
-    #[test]
-    fn screenshot_size_cache_can_be_cleared() {
-        let backend = ComputerUseLinux::default();
-        backend.cache_screenshot_size(3840, 1080);
-
-        backend.clear_screenshot_size();
-
-        assert_eq!(backend.to_ydotool_absolute_point(1550, 930), (1550, 930));
-
-        backend.cache_screenshot_size(3840, 1080);
-        backend.cache_screenshot_size(0, 1080);
-
-        assert_eq!(backend.to_ydotool_absolute_point(1550, 930), (1550, 930));
+    fn pointer_actions_keep_pixel_coordinates_for_ydotool_absolute_moves() {
+        assert_eq!(
+            absolute_mousemove_args(1550, 930),
+            vec![
+                "mousemove".to_string(),
+                "--absolute".to_string(),
+                "--".to_string(),
+                "1550".to_string(),
+                "930".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -996,5 +2644,170 @@ mod tests {
             key_sequence("Super"),
             Some(vec!["125:1".to_string(), "125:0".to_string()])
         );
+    }
+
+    #[test]
+    fn element_identifier_overrides_cached_object_ref() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node(7, None)]);
+
+        let object_ref = backend
+            .resolve_object_ref(
+                Some(7),
+                Some(":1.99/org/a11y/atspi/accessible/3"),
+                &ElementSelector::default(),
+                ElementResolvePurpose::Action,
+            )
+            .unwrap();
+
+        assert_eq!(object_ref, ":1.99/org/a11y/atspi/accessible/3");
+    }
+
+    #[test]
+    fn element_index_resolves_to_cached_object_ref() {
+        let backend = ComputerUseLinux::default();
+        backend.cache_nodes(&[node(7, None)]);
+
+        let object_ref = backend
+            .resolve_object_ref(
+                Some(7),
+                None,
+                &ElementSelector::default(),
+                ElementResolvePurpose::Action,
+            )
+            .unwrap();
+
+        assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+    }
+
+    #[test]
+    fn semantic_selector_resolves_unique_cached_node_by_role_and_name() {
+        let backend = ComputerUseLinux::default();
+        let mut search_entry = node(7, None);
+        search_entry.role = "entry".to_string();
+        search_entry.name = Some("Search files".to_string());
+        search_entry.supports_editable_text = true;
+        backend.cache_nodes(&[search_entry]);
+
+        let object_ref = backend
+            .resolve_object_ref(
+                None,
+                None,
+                &ElementSelector {
+                    role: Some("entry"),
+                    name: Some("search"),
+                    ..Default::default()
+                },
+                ElementResolvePurpose::SetValue,
+            )
+            .unwrap();
+
+        assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+    }
+
+    #[test]
+    fn semantic_selector_prefers_actionable_match() {
+        let backend = ComputerUseLinux::default();
+        let mut label = node(4, None);
+        label.role = "label".to_string();
+        label.name = Some("Close".to_string());
+        let mut button = node_with_actions(7, None, vec![click_action()]);
+        button.role = "push button".to_string();
+        button.name = Some("Close".to_string());
+        backend.cache_nodes(&[label, button]);
+
+        let object_ref = backend
+            .resolve_object_ref(
+                None,
+                None,
+                &ElementSelector {
+                    name: Some("close"),
+                    ..Default::default()
+                },
+                ElementResolvePurpose::Action,
+            )
+            .unwrap();
+
+        assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+    }
+
+    #[test]
+    fn semantic_selector_prefers_editable_match() {
+        let backend = ComputerUseLinux::default();
+        let mut label = node(4, None);
+        label.role = "label".to_string();
+        label.name = Some("Search".to_string());
+        let mut entry = node(7, None);
+        entry.role = "entry".to_string();
+        entry.name = Some("Search".to_string());
+        entry.supports_editable_text = true;
+        backend.cache_nodes(&[label, entry]);
+
+        let object_ref = backend
+            .resolve_object_ref(
+                None,
+                None,
+                &ElementSelector {
+                    name: Some("search"),
+                    ..Default::default()
+                },
+                ElementResolvePurpose::SetValue,
+            )
+            .unwrap();
+
+        assert_eq!(object_ref, ":1.7/org/a11y/atspi/accessible/7");
+    }
+
+    #[test]
+    fn semantic_selector_reports_ambiguous_matches() {
+        let backend = ComputerUseLinux::default();
+        let mut first = node_with_actions(7, None, vec![click_action()]);
+        first.name = Some("Close".to_string());
+        let mut second = node_with_actions(9, None, vec![click_action()]);
+        second.name = Some("Close".to_string());
+        backend.cache_nodes(&[first, second]);
+
+        let error = backend
+            .resolve_object_ref(
+                None,
+                None,
+                &ElementSelector {
+                    name: Some("close"),
+                    ..Default::default()
+                },
+                ElementResolvePurpose::Action,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("matched multiple cached nodes"));
+        assert!(error.contains("element_index 7"));
+        assert!(error.contains("element_index 9"));
+    }
+
+    #[test]
+    fn semantic_click_selector_resolves_coordinates() {
+        let backend = ComputerUseLinux::default();
+        let mut button = node_with_actions(
+            7,
+            Some(Bounds {
+                x: 10,
+                y: 20,
+                width: 100,
+                height: 40,
+            }),
+            vec![click_action()],
+        );
+        button.name = Some("Run".to_string());
+        backend.cache_nodes(&[button]);
+
+        let target = backend
+            .resolve_click_target(&ClickParams {
+                role: Some("button".to_string()),
+                name: Some("run".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(matches!(target, ClickTarget::Coordinates(60, 40)));
     }
 }

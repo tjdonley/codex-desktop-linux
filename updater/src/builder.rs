@@ -14,7 +14,7 @@ use std::{
 use tokio::process::Command;
 use tracing::info;
 
-const REQUIRED_BUNDLE_FILES: [(&str, &str); 12] = [
+const REQUIRED_BUNDLE_FILES: [(&str, &str); 13] = [
     ("Cargo.toml", "Cargo.toml"),
     ("Cargo.lock", "Cargo.lock"),
     ("computer-use-linux", "computer-use-linux"),
@@ -30,6 +30,7 @@ const REQUIRED_BUNDLE_FILES: [(&str, &str); 12] = [
         "scripts/patch-linux-window-ui.js",
         "scripts/patch-linux-window-ui.js",
     ),
+    ("scripts/patches", "scripts/patches"),
     ("scripts/lib", "scripts/lib"),
     ("packaging/linux", "packaging/linux"),
     ("assets/codex.png", "assets/codex.png"),
@@ -497,6 +498,7 @@ touch "${DIST_DIR_OVERRIDE}/codex-desktop-${VER}-1-x86_64.pkg.tar.zst"
         let state_root = temp.path().join("state");
         let cache_root = temp.path().join("cache");
         fs::create_dir_all(bundle_root.join("scripts/lib"))?;
+        fs::create_dir_all(bundle_root.join("scripts/patches"))?;
         fs::create_dir_all(bundle_root.join("launcher"))?;
         fs::create_dir_all(bundle_root.join("packaging/linux"))?;
         fs::create_dir_all(bundle_root.join("assets"))?;
@@ -589,6 +591,10 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
             b"console.log('patched');\n",
         )?;
         fs::write(
+            bundle_root.join("scripts/patches/registry.js"),
+            b"module.exports = {};\n",
+        )?;
+        fs::write(
             bundle_root.join("scripts/lib/package-common.sh"),
             b"#!/bin/bash\n",
         )?;
@@ -640,6 +646,10 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
             .workspace_dir
             .join("builder/scripts/lib/node-runtime.sh")
             .exists());
+        assert!(artifacts
+            .workspace_dir
+            .join("builder/scripts/patches/registry.js")
+            .exists());
         assert!(
             is_native_package_file(&artifacts.package_path),
             "expected a native package (.deb, .rpm, or .pkg.tar.zst), got {}",
@@ -655,6 +665,7 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
         let destination_root = temp.path().join("destination");
 
         fs::create_dir_all(source_root.join("scripts/lib"))?;
+        fs::create_dir_all(source_root.join("scripts/patches"))?;
         fs::create_dir_all(source_root.join("launcher"))?;
         fs::create_dir_all(source_root.join("packaging/linux"))?;
         fs::create_dir_all(source_root.join("assets"))?;
@@ -668,6 +679,10 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
         fs::write(
             source_root.join("scripts/patch-linux-window-ui.js"),
             b"console.log('patched');\n",
+        )?;
+        fs::write(
+            source_root.join("scripts/patches/registry.js"),
+            b"module.exports = {};\n",
         )?;
         fs::write(
             source_root.join("scripts/lib/package-common.sh"),
@@ -692,6 +707,9 @@ chmod +x "${CODEX_INSTALL_DIR}/start.sh"
         assert!(destination_root.join("scripts/build-deb.sh").exists());
         assert!(destination_root
             .join("scripts/patch-linux-window-ui.js")
+            .exists());
+        assert!(destination_root
+            .join("scripts/patches/registry.js")
             .exists());
         assert!(destination_root.join("computer-use-linux").exists());
         assert!(destination_root.join("updater").exists());

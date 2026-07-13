@@ -17,6 +17,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::{
     collections::HashSet,
+    ffi::OsStr,
     fs,
     io::{BufReader, Read},
     os::unix::fs::{self as unix_fs, PermissionsExt},
@@ -373,7 +374,9 @@ async fn apply_packaged(
     paths: &RuntimePaths,
     candidate_commit: Option<&str>,
 ) -> Result<()> {
-    if let Some(missing) = missing_build_dependency() {
+    if let Some(missing) =
+        missing_build_dependency(&config.builder_bundle_root, install::PackageKind::detect())
+    {
         let body = format!(
             "A newer ChatGPT Desktop for Linux build is available, but '{missing}' is needed to rebuild it. Install the build tools or update the package manually."
         );
@@ -560,26 +563,70 @@ fn derive_package_version(dmg_path: &Path) -> Result<String> {
     upstream::derive_candidate_version(&sha, chrono::Utc::now())
 }
 
+const REQUIRED_BUILD_DEPENDENCIES: &[(&str, &str)] = &[
+    ("cargo", "cargo"),
+    ("python3", "python3"),
+    ("curl", "curl"),
+    ("unzip", "unzip"),
+    ("tar", "tar"),
+    ("flock", "flock"),
+    ("make", "make"),
+    ("g++", "g++"),
+];
+
+fn package_build_dependencies(
+    package_kind: install::PackageKind,
+) -> &'static [(&'static str, &'static str)] {
+    match package_kind {
+        install::PackageKind::Deb => &[("dpkg", "dpkg"), ("dpkg-deb", "dpkg-deb")],
+        install::PackageKind::Rpm => &[("rpmbuild", "rpmbuild")],
+        install::PackageKind::Pacman => &[("makepkg", "makepkg")],
+    }
+}
+
 /// Returns the first missing build dependency needed for a packaged rebuild, or
 /// `None` when the toolchain is present.
-fn missing_build_dependency() -> Option<&'static str> {
-    // install.sh needs a DMG extractor (7z/7zz) and the package build runs cargo
-    // for the updater; node is provided by the bundled managed runtime.
-    for (tool, label) in [("cargo", "cargo"), ("7zz", "7zz")] {
-        if which(tool).is_none() {
-            // 7z is an acceptable alternative to 7zz.
-            if tool == "7zz" && which("7z").is_some() {
-                continue;
-            }
+fn missing_build_dependency(
+    builder_bundle_root: &Path,
+    package_kind: install::PackageKind,
+) -> Option<&'static str> {
+    let build_path = match builder::build_command_path(builder_bundle_root) {
+        Ok(path) => path,
+        Err(error) => {
+            warn!(?error, "could not construct trusted wrapper rebuild PATH");
+            return Some("trusted system build tools");
+        }
+    };
+    missing_build_dependency_on_path(&build_path, package_kind)
+}
+
+fn missing_build_dependency_on_path(
+    path: &OsStr,
+    package_kind: install::PackageKind,
+) -> Option<&'static str> {
+    // Keep this aligned with install.sh's check_deps, updater compilation, and
+    // the selected native package builder. Node comes from the managed runtime.
+    for &(tool, label) in REQUIRED_BUILD_DEPENDENCIES {
+        if which_on_path(tool, path).is_none() {
+            return Some(label);
+        }
+    }
+    if which_on_path("7zz", path).is_none() && which_on_path("7z", path).is_none() {
+        return Some("7z or 7zz");
+    }
+    for &(tool, label) in package_build_dependencies(package_kind) {
+        if which_on_path(tool, path).is_none() {
             return Some(label);
         }
     }
     None
 }
 
-fn which(tool: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+fn which_on_path(tool: &str, path: &OsStr) -> Option<PathBuf> {
     for dir in std::env::split_paths(&path) {
+        if !dir.is_absolute() {
+            continue;
+        }
         let candidate = dir.join(tool);
         if candidate.is_file()
             && candidate
@@ -625,6 +672,30 @@ mod tests {
         }
     }
 
+    fn write_executable_tool(directory: &Path, tool: &str) -> Result<()> {
+        let path = directory.join(tool);
+        fs::write(&path, b"tool")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    }
+
+    fn write_common_build_dependencies(directory: &Path) -> Result<()> {
+        for &(tool, _) in REQUIRED_BUILD_DEPENDENCIES {
+            write_executable_tool(directory, tool)?;
+        }
+        write_executable_tool(directory, "7z")
+    }
+
+    fn write_package_build_dependencies(
+        directory: &Path,
+        package_kind: install::PackageKind,
+    ) -> Result<()> {
+        for &(tool, _) in package_build_dependencies(package_kind) {
+            write_executable_tool(directory, tool)?;
+        }
+        Ok(())
+    }
+
     #[test]
     fn automated_user_local_commands_force_safety_overrides_off() {
         for program in ["codex-desktop-update", "install.sh"] {
@@ -648,6 +719,108 @@ mod tests {
                 "{program} must not bypass acceptance"
             );
         }
+    }
+
+    #[test]
+    fn dependency_preflight_does_not_fall_back_to_inherited_path() -> Result<()> {
+        let _env_guard = crate::test_util::env_lock();
+        let _restore_env = crate::test_util::EnvRestoreGuard::capture(&["PATH"]);
+        let root = tempdir()?;
+        let user_bin = root.path().join("user-bin");
+        fs::create_dir_all(&user_bin)?;
+        for &(tool, _) in REQUIRED_BUILD_DEPENDENCIES {
+            write_executable_tool(&user_bin, tool)?;
+        }
+        write_executable_tool(&user_bin, "7zz")?;
+        std::env::set_var("PATH", std::env::join_paths([&user_bin])?);
+
+        assert_eq!(
+            missing_build_dependency_on_path(
+                OsStr::new("/missing-trusted-bin"),
+                install::PackageKind::Deb,
+            ),
+            Some("cargo")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_preflight_checks_the_supplied_build_path() -> Result<()> {
+        let root = tempdir()?;
+        let build_bin = root.path().join("build-bin");
+        fs::create_dir_all(&build_bin)?;
+        write_common_build_dependencies(&build_bin)?;
+        write_package_build_dependencies(&build_bin, install::PackageKind::Deb)?;
+        let build_path = std::env::join_paths([&build_bin])?;
+
+        assert_eq!(
+            missing_build_dependency_on_path(&build_path, install::PackageKind::Deb),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_preflight_reports_each_required_tool() -> Result<()> {
+        let root = tempdir()?;
+        for &(missing_tool, missing_label) in REQUIRED_BUILD_DEPENDENCIES {
+            let build_bin = root.path().join(format!("without-{missing_label}"));
+            fs::create_dir_all(&build_bin)?;
+            for &(tool, _) in REQUIRED_BUILD_DEPENDENCIES {
+                if tool != missing_tool {
+                    write_executable_tool(&build_bin, tool)?;
+                }
+            }
+            write_executable_tool(&build_bin, "7zz")?;
+            write_package_build_dependencies(&build_bin, install::PackageKind::Deb)?;
+            let build_path = std::env::join_paths([&build_bin])?;
+            assert_eq!(
+                missing_build_dependency_on_path(&build_path, install::PackageKind::Deb),
+                Some(missing_label)
+            );
+        }
+
+        let without_extractor = root.path().join("without-extractor");
+        fs::create_dir_all(&without_extractor)?;
+        for &(tool, _) in REQUIRED_BUILD_DEPENDENCIES {
+            write_executable_tool(&without_extractor, tool)?;
+        }
+        write_package_build_dependencies(&without_extractor, install::PackageKind::Deb)?;
+        let build_path = std::env::join_paths([&without_extractor])?;
+        assert_eq!(
+            missing_build_dependency_on_path(&build_path, install::PackageKind::Deb),
+            Some("7z or 7zz")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_preflight_checks_the_selected_package_builder() -> Result<()> {
+        let root = tempdir()?;
+        for (package_kind, tools) in [
+            (install::PackageKind::Deb, &["dpkg", "dpkg-deb"][..]),
+            (install::PackageKind::Rpm, &["rpmbuild"][..]),
+            (install::PackageKind::Pacman, &["makepkg"][..]),
+        ] {
+            for missing_tool in tools {
+                let build_bin = root
+                    .path()
+                    .join(format!("{package_kind:?}-without-{missing_tool}"));
+                fs::create_dir_all(&build_bin)?;
+                write_common_build_dependencies(&build_bin)?;
+                for tool in tools {
+                    if tool != missing_tool {
+                        write_executable_tool(&build_bin, tool)?;
+                    }
+                }
+                let build_path = std::env::join_paths([&build_bin])?;
+                assert_eq!(
+                    missing_build_dependency_on_path(&build_path, package_kind),
+                    Some(*missing_tool)
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]

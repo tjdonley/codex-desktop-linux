@@ -7936,6 +7936,214 @@ test_browser_plugin_renamed_upstream_staging() {
     assert_not_contains "$output_log" "Browser bundled plugin resources not present"
 }
 
+test_browser_plugin_marketplace_source_containment() {
+    info "Checking Browser marketplace source containment"
+    local workspace="$TMP_DIR/browser-plugin-source-containment"
+    local bundled_root="$workspace/openai-bundled"
+    local marketplace="$bundled_root/.agents/plugins/marketplace.json"
+    local bundled_root_alias="$workspace/openai-bundled-link"
+    local safe_browser="$bundled_root/plugins/browser-renamed"
+    local nested_browser="$bundled_root/plugins/vendor/browser-nested"
+    local nested_symlink_browser="$bundled_root/plugins/browser-nested-link"
+    local internal_symlink_browser="$bundled_root/plugins/browser-internal-link"
+    local outside_browser="$workspace/outside-browser"
+    local staged_root="$workspace/staged/openai-bundled"
+    local staged_browser="$staged_root/plugins/browser"
+    local staged_marketplace="$staged_root/.agents/plugins/marketplace.json"
+    local staged_root_alias="$workspace/staged-openai-bundled-link"
+    local outside_stage_plugins="$workspace/outside-stage-plugins"
+    local outside_marketplace="$workspace/outside-marketplace.json"
+    local stage_plugins_link="$workspace/stage-plugins-link"
+    local failed_copy_plugins="$workspace/failed-copy-plugins"
+    local found=""
+    local invalid_marketplace=""
+    local plugin_dir=""
+    local unsafe_path=""
+
+    for plugin_dir in \
+        "$safe_browser" \
+        "$nested_browser" \
+        "$outside_browser" \
+        "$staged_browser"
+    do
+        mkdir -p "$plugin_dir/.codex-plugin" "$plugin_dir/scripts"
+        printf '%s\n' '{"name":"browser","version":"1.0.0"}' \
+            > "$plugin_dir/.codex-plugin/plugin.json"
+        printf '%s\n' 'export {};' > "$plugin_dir/scripts/browser-client.mjs"
+    done
+    mkdir -p "$nested_symlink_browser/.codex-plugin"
+    printf '%s\n' '{"name":"browser","version":"1.0.0"}' \
+        > "$nested_symlink_browser/.codex-plugin/plugin.json"
+    ln -s "$outside_browser/scripts" "$nested_symlink_browser/scripts"
+    mkdir -p \
+        "$internal_symlink_browser/.codex-plugin" \
+        "$internal_symlink_browser/actual-scripts"
+    printf '%s\n' '{"name":"browser","version":"1.0.0"}' \
+        > "$internal_symlink_browser/.codex-plugin/plugin.json"
+    printf '%s\n' 'export {};' \
+        > "$internal_symlink_browser/actual-scripts/browser-client.mjs"
+    ln -s "$internal_symlink_browser/actual-scripts" \
+        "$internal_symlink_browser/scripts"
+    mkdir -p "$(dirname "$marketplace")" "$(dirname "$staged_marketplace")"
+    ln -s "$outside_browser" "$bundled_root/plugins/browser-link"
+    ln -s "$bundled_root/plugins/vendor" "$bundled_root/plugins/vendor-link"
+    ln -s "$bundled_root" "$bundled_root_alias"
+    ln -s "$staged_root" "$staged_root_alias"
+    mkdir -p "$outside_stage_plugins"
+    mkdir -p "$failed_copy_plugins"
+    printf '%s\n' keep > "$outside_stage_plugins/marker"
+    ln -s "$outside_stage_plugins" "$stage_plugins_link"
+
+    node - "$marketplace" <<'NODE'
+const fs = require("fs");
+const output = process.argv[2];
+fs.writeFileSync(output, JSON.stringify({
+  plugins: [
+    {
+      name: "browser",
+      source: { source: "local", path: "../outside-browser" },
+      policy: { installation: "BLOCKED", authentication: "NEVER" },
+      category: "Unsafe sentinel",
+      unsafeSentinel: true,
+    },
+    { name: "browser", source: { source: "local", path: "./plugins/browser-renamed" } },
+  ],
+}));
+NODE
+
+    # shellcheck disable=SC1091
+    source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
+    found="$(find_browser_plugin_source "$bundled_root" "$marketplace")" \
+        || fail "Expected the contained renamed Browser plugin to be found"
+    [ "$found" = "$safe_browser" ] \
+        || fail "Expected contained Browser source $safe_browser, got $found"
+
+    write_bundled_plugins_marketplace "$marketplace" "$staged_marketplace" 1 0 0
+    node - "$staged_marketplace" <<'NODE'
+const fs = require("fs");
+const marketplace = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+if (marketplace.plugins.length !== 1) {
+  throw new Error(`expected one Browser entry, got ${marketplace.plugins.length}`);
+}
+const browser = marketplace.plugins[0];
+if (browser.source?.source !== "local" || browser.source.path !== "./plugins/browser") {
+  throw new Error(`unsafe staged Browser source: ${JSON.stringify(browser.source)}`);
+}
+if (
+  browser.policy?.installation !== "AVAILABLE" ||
+  browser.policy?.authentication !== "ON_INSTALL" ||
+  browser.category !== "Engineering" ||
+  "unsafeSentinel" in browser
+) {
+  throw new Error(`unsafe Browser metadata was preserved: ${JSON.stringify(browser)}`);
+}
+NODE
+
+    for unsafe_path in \
+        "../outside-browser" \
+        "$outside_browser" \
+        "./plugins/browser-link" \
+        "./plugins/browser-nested-link" \
+        "./plugins/browser-internal-link" \
+        "./plugins/vendor-link/browser-nested"
+    do
+        node - "$marketplace" "$unsafe_path" <<'NODE'
+const fs = require("fs");
+const output = process.argv[2];
+const sourcePath = process.argv[3];
+fs.writeFileSync(output, JSON.stringify({
+  plugins: [{ name: "browser", source: { source: "local", path: sourcePath } }],
+}));
+NODE
+        if found="$(find_browser_plugin_source "$bundled_root" "$marketplace")"; then
+            fail "Expected unsafe Browser marketplace path to be rejected: $unsafe_path (resolved to $found)"
+        fi
+    done
+    if found="$(find_browser_plugin_source "$bundled_root_alias" "$marketplace")"; then
+        fail "Expected a symlinked bundled marketplace root to be rejected: $found"
+    fi
+
+    if write_bundled_plugins_marketplace \
+        "$marketplace" "$staged_root_alias/.agents/plugins/marketplace.json" 1 0 0 \
+        >/dev/null 2>&1; then
+        fail "Expected a symlinked staged marketplace root to be rejected"
+    fi
+    mv "$staged_root/.agents" "$staged_root/.agents-real"
+    ln -s "$outside_stage_plugins" "$staged_root/.agents"
+    if write_bundled_plugins_marketplace \
+        "$marketplace" "$staged_marketplace" 1 0 0 >/dev/null 2>&1; then
+        fail "Expected a symlinked staged marketplace metadata directory to be rejected"
+    fi
+    rm "$staged_root/.agents"
+    mv "$staged_root/.agents-real" "$staged_root/.agents"
+
+    printf '%s\n' 'outside marker' > "$outside_marketplace"
+    rm -f "$staged_marketplace"
+    ln -s "$outside_marketplace" "$staged_marketplace"
+    if write_bundled_plugins_marketplace \
+        "$marketplace" "$staged_marketplace" 1 0 0 >/dev/null 2>&1; then
+        fail "Expected a symlinked staged marketplace destination file to be rejected"
+    fi
+    assert_contains "$outside_marketplace" 'outside marker'
+    rm "$staged_marketplace"
+    if (
+        warn() { info "$@"; }
+        stage_browser_plugin_from_upstream "$safe_browser" "$stage_plugins_link"
+    ); then
+        fail "Expected a symlinked Browser staging plugins root to be rejected"
+    fi
+    assert_file_exists "$outside_stage_plugins/marker"
+    assert_file_not_exists "$outside_stage_plugins/browser"
+    if (
+        warn() { info "$@"; }
+        cp() { return 1; }
+        stage_browser_plugin_from_upstream "$safe_browser" "$failed_copy_plugins"
+    ); then
+        fail "Expected a failed Browser source copy to propagate"
+    fi
+    assert_file_not_exists "$failed_copy_plugins/browser"
+
+    for invalid_marketplace in '[]' '"invalid"' '1' 'true'; do
+        printf '%s\n' "$invalid_marketplace" > "$marketplace"
+        if write_bundled_plugins_marketplace \
+            "$marketplace" "$staged_marketplace" 1 0 0 >/dev/null 2>&1; then
+            fail "Expected invalid top-level marketplace JSON to be rejected: $invalid_marketplace"
+        fi
+    done
+
+    mv "$staged_browser" "$staged_root/plugins/browser-real"
+    ln -s "$staged_root/plugins/browser-real" "$staged_browser"
+    if write_bundled_plugins_marketplace \
+        "$marketplace" "$staged_marketplace" 1 0 0 \
+        >/dev/null 2>&1; then
+        fail "Expected a symlinked staged Browser directory to be rejected"
+    fi
+    rm "$staged_browser"
+    mv "$staged_root/plugins/browser-real" "$staged_browser"
+
+    node - "$marketplace" <<'NODE'
+const fs = require("fs");
+const output = process.argv[2];
+fs.writeFileSync(output, JSON.stringify({
+  plugins: [
+    { name: "browser", source: { source: "local", path: "./plugins/vendor/browser-nested" } },
+  ],
+}));
+NODE
+    found="$(find_browser_plugin_source "$bundled_root" "$marketplace")" \
+        || fail "Expected a contained nested Browser source to be found"
+    [ "$found" = "$nested_browser" ] \
+        || fail "Expected nested Browser source $nested_browser, got $found"
+    (
+        warn() { info "$@"; }
+        stage_browser_plugin_from_upstream "$found" "$staged_root/plugins"
+    ) || fail "Expected a nested Browser source to stage under the fixed Browser name"
+    assert_file_exists "$staged_browser/scripts/browser-client.mjs"
+    write_bundled_plugins_marketplace "$marketplace" "$staged_marketplace" 1 0 0
+    assert_contains "$staged_marketplace" '"path": "./plugins/browser"'
+    assert_not_contains "$staged_marketplace" 'vendor/browser-nested'
+}
+
 test_upstream_bundled_skills_staging() {
     info "Checking current upstream bundled skills staging"
     local workspace="$TMP_DIR/upstream-bundled-skills"
@@ -8519,31 +8727,277 @@ NODE
 test_browser_use_node_repl_glibc_pidfd_patch_static() {
     info "Checking Browser Use node_repl glibc pidfd patch scope"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "patch_browser_use_node_repl_glibc_pidfd_symbols"
-    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "is_browser_use_node_repl_ldd_output_compatible"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "validate_browser_use_node_repl_elf_compatibility"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "install_browser_use_node_repl_executable_resource"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "pidfd_spawnp"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "pidfd_getpid"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "GLIBC_2.39"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "GLIBC_2.34"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "non-pidfd GLIBC_2.39 references remain"
-    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" 'ldd "$destination"'
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "unexpected shared-library dependencies"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "unexpected ELF interpreter"
+    assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" 'ldd "$destination"'
+    assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "command -v ldd"
+    assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "is_browser_use_node_repl_ldd_output_compatible"
 }
 
-test_browser_use_node_repl_ldd_output_compatibility() {
-    info "Checking Browser Use node_repl ldd output compatibility gate"
-    # shellcheck disable=SC1091
-    source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
+test_browser_use_node_repl_static_elf_compatibility() {
+    info "Checking Browser Use node_repl static ELF compatibility gate"
+    local host_arch
+    host_arch="$(uname -m)"
+    case "$host_arch" in
+        x86_64|aarch64|arm64) ;;
+        *)
+            info "Skipping static ELF compatibility fixture on unsupported host $host_arch"
+            return 0
+            ;;
+    esac
 
-    if is_browser_use_node_repl_ldd_output_compatible "/node_repl: /lib/x86_64-linux-gnu/libc.so.6: version 'GLIBC_2.39' not found (required by /node_repl)"; then
-        fail "Expected ldd GLIBC version errors to be rejected"
-    fi
+    local workspace="$TMP_DIR/browser-use-static-elf"
+    local source_file="$workspace/node-repl-fixture.c"
+    local safe_elf="$workspace/node_repl"
+    local fake_bin="$workspace/fake-bin"
+    local destination="$workspace/destination"
+    local execution_marker="$workspace/executed-target"
+    local tool_marker="$workspace/executed-tool"
+    local compiler
+    local tool
 
-    if is_browser_use_node_repl_ldd_output_compatible "libmissing.so => not found"; then
-        fail "Expected unresolved ldd libraries to be rejected"
-    fi
+    compiler="$(PATH="$HOST_TOOL_PATH" type -P cc)" \
+        || fail "A C compiler is required for the static ELF compatibility test"
+    mkdir -p "$workspace" "$fake_bin"
+    cat > "$source_file" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
 
-    is_browser_use_node_repl_ldd_output_compatible "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6" \
-        || fail "Expected ordinary ldd output to be accepted"
+__attribute__((constructor)) static void mark_execution(void) {
+    const char *path = getenv("CODEX_ELF_EXEC_MARKER");
+    if (path != NULL) {
+        FILE *marker = fopen(path, "w");
+        if (marker != NULL) {
+            fputs("executed\n", marker);
+            fclose(marker);
+        }
+    }
+}
+
+int main(void) {
+    return 0;
+}
+C
+    "$compiler" -O0 -o "$safe_elf" "$source_file"
+
+    for tool in ldd readelf objdump lddtree; do
+        cat > "$fake_bin/$tool" <<'SH'
+#!/bin/sh
+tool_name="${0##*/}"
+printf '%s\n' "$tool_name" > "${CODEX_ELF_TOOL_MARKER}.${tool_name}"
+if [ "$tool_name" = "ldd" ]; then
+    "$1"
+fi
+SH
+        chmod 0755 "$fake_bin/$tool"
+    done
+
+    (
+        warn() { echo "[WARN] $*" >&2; }
+        info() { echo "[INFO] $*" >&2; }
+        # shellcheck disable=SC1091
+        source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
+        ARCH="$host_arch"
+
+        CODEX_ELF_EXEC_MARKER="$execution_marker" \
+        CODEX_ELF_TOOL_MARKER="$tool_marker" \
+        PATH="$fake_bin:$HOST_TOOL_PATH" \
+            install_browser_use_node_repl_executable_resource \
+                "$safe_elf" "$destination" "static compatibility fixture"
+        assert_file_exists "$destination"
+        [ ! -e "$execution_marker" ] \
+            || fail "Static ELF validation executed the staged target"
+        [ -z "$(find "$workspace" -maxdepth 1 -name 'executed-tool.*' -print -quit)" ] \
+            || fail "Static ELF validation invoked an external inspection tool"
+
+        local unexpected_dependency="$workspace/unexpected-dependency"
+        python3 - "$safe_elf" "$unexpected_dependency" <<'PY'
+from pathlib import Path
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+if b"libc.so.6\0" not in data:
+    raise SystemExit("fixture has no libc dependency to mutate")
+Path(sys.argv[2]).write_bytes(data.replace(b"libc.so.6\0", b"evil.so.6\0", 1))
+PY
+        if install_browser_use_node_repl_executable_resource \
+            "$unexpected_dependency" "$destination" "unexpected dependency fixture"; then
+            fail "Expected an unexpected ELF dependency to be rejected"
+        fi
+        [ ! -e "$destination" ] \
+            || fail "Rejected unexpected dependency left a staged executable"
+
+        local future_glibc="$workspace/future-glibc"
+        python3 - "$safe_elf" "$future_glibc" <<'PY'
+from pathlib import Path
+import re
+import struct
+import sys
+
+data = Path(sys.argv[1]).read_bytes()
+match = re.search(rb"GLIBC_[0-9]+(?:\.[0-9]+)+\0", data)
+if match is None:
+    raise SystemExit("fixture has no GLIBC version to mutate")
+replacement = re.sub(rb"[0-9]", b"9", match.group(0))
+mutated = bytearray(data[:match.start()] + replacement + data[match.end():])
+
+def elf_hash(value):
+    result = 0
+    for byte in value:
+        result = (result << 4) + byte
+        high = result & 0xF0000000
+        if high:
+            result ^= high >> 24
+            result &= ~high
+    return result & 0xFFFFFFFF
+
+section_offset = int.from_bytes(mutated[40:48], "little")
+section_size = int.from_bytes(mutated[58:60], "little")
+section_count = int.from_bytes(mutated[60:62], "little")
+sections = []
+for index in range(section_count):
+    offset = section_offset + index * section_size
+    fields = struct.unpack_from("<IIQQQQIIQQ", mutated, offset)
+    sections.append({"type": fields[1], "offset": fields[4], "size": fields[5], "link": fields[6]})
+
+dynstr_index = next(
+    index
+    for index, section in enumerate(sections)
+    if section["type"] == 3
+    and section["offset"] <= match.start() < section["offset"] + section["size"]
+)
+name_offset = match.start() - sections[dynstr_index]["offset"]
+verneed = next(
+    section
+    for section in sections
+    if section["type"] == 0x6FFFFFFE and section["link"] == dynstr_index
+)
+updated_hashes = 0
+cursor = verneed["offset"]
+end = cursor + verneed["size"]
+while cursor + 16 <= end:
+    _version, count, _file, aux_offset, next_offset = struct.unpack_from(
+        "<HHIII", mutated, cursor
+    )
+    aux_cursor = cursor + aux_offset
+    for _ in range(count):
+        _hash, _flags, _other, aux_name_offset, aux_next = struct.unpack_from(
+            "<IHHII", mutated, aux_cursor
+        )
+        if aux_name_offset == name_offset:
+            struct.pack_into("<I", mutated, aux_cursor, elf_hash(replacement[:-1]))
+            updated_hashes += 1
+        if aux_next == 0:
+            break
+        aux_cursor += aux_next
+    if next_offset == 0:
+        break
+    cursor += next_offset
+if updated_hashes == 0:
+    raise SystemExit("fixture GLIBC version has no Vernaux hash to update")
+Path(sys.argv[2]).write_bytes(mutated)
+PY
+        local future_error=""
+        if future_error="$(install_browser_use_node_repl_executable_resource \
+            "$future_glibc" "$destination" "future glibc fixture" 2>&1)"; then
+            fail "Expected a future GLIBC requirement to be rejected"
+        fi
+        case "$future_error" in
+            *"exceeds host GLIBC"*) ;;
+            *) fail "Expected future GLIBC rejection, got: $future_error" ;;
+        esac
+        [ ! -e "$destination" ] \
+            || fail "Rejected future GLIBC fixture left a staged executable"
+
+        local truncated="$workspace/truncated-elf"
+        head -c 128 "$safe_elf" > "$truncated"
+        if install_browser_use_node_repl_executable_resource \
+            "$truncated" "$destination" "truncated ELF fixture"; then
+            fail "Expected a truncated ELF to be rejected"
+        fi
+        [ ! -e "$destination" ] \
+            || fail "Rejected truncated ELF left a staged executable"
+
+        local header_count_bomb="$workspace/header-count-bomb"
+        local dynamic_view_mismatch="$workspace/dynamic-view-mismatch"
+        local dynamic_string_mismatch="$workspace/dynamic-string-mismatch"
+        python3 - \
+            "$safe_elf" \
+            "$header_count_bomb" \
+            "$dynamic_view_mismatch" \
+            "$dynamic_string_mismatch" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+source = bytearray(Path(sys.argv[1]).read_bytes())
+
+header_count_bomb = bytearray(source)
+struct.pack_into("<H", header_count_bomb, 56, 0xFFFF)
+Path(sys.argv[2]).write_bytes(header_count_bomb)
+
+section_mismatch = bytearray(source)
+section_offset = struct.unpack_from("<Q", section_mismatch, 40)[0]
+section_size = struct.unpack_from("<H", section_mismatch, 58)[0]
+section_count = struct.unpack_from("<H", section_mismatch, 60)[0]
+for index in range(section_count):
+    offset = section_offset + index * section_size
+    if struct.unpack_from("<I", section_mismatch, offset + 4)[0] == 6:
+        dynamic_size = struct.unpack_from("<Q", section_mismatch, offset + 32)[0]
+        struct.pack_into("<Q", section_mismatch, offset + 32, dynamic_size - 16)
+        break
+else:
+    raise SystemExit("fixture has no dynamic section")
+Path(sys.argv[3]).write_bytes(section_mismatch)
+
+string_mismatch = bytearray(source)
+program_offset = struct.unpack_from("<Q", string_mismatch, 32)[0]
+program_size = struct.unpack_from("<H", string_mismatch, 54)[0]
+program_count = struct.unpack_from("<H", string_mismatch, 56)[0]
+for index in range(program_count):
+    offset = program_offset + index * program_size
+    if struct.unpack_from("<I", string_mismatch, offset)[0] != 2:
+        continue
+    dynamic_offset = struct.unpack_from("<Q", string_mismatch, offset + 8)[0]
+    dynamic_size = struct.unpack_from("<Q", string_mismatch, offset + 32)[0]
+    for entry_offset in range(dynamic_offset, dynamic_offset + dynamic_size, 16):
+        tag, value = struct.unpack_from("<qQ", string_mismatch, entry_offset)
+        if tag == 5:
+            struct.pack_into("<Q", string_mismatch, entry_offset + 8, value + 1)
+            Path(sys.argv[4]).write_bytes(string_mismatch)
+            raise SystemExit(0)
+raise SystemExit("fixture has no dynamic string-table pointer")
+PY
+
+        local malformed_elf=""
+        for malformed_elf in \
+            "$header_count_bomb" \
+            "$dynamic_view_mismatch" \
+            "$dynamic_string_mismatch"
+        do
+            if install_browser_use_node_repl_executable_resource \
+                "$malformed_elf" "$destination" "bounded malformed ELF fixture"; then
+                fail "Expected malformed ELF metadata to be rejected: $malformed_elf"
+            fi
+            [ ! -e "$destination" ] \
+                || fail "Rejected malformed ELF left a staged executable: $malformed_elf"
+        done
+
+        local oversized_elf="$workspace/oversized-elf"
+        cp "$safe_elf" "$oversized_elf"
+        truncate -s 134217729 "$oversized_elf"
+        if validate_browser_use_node_repl_elf_compatibility \
+            "$oversized_elf" "$host_arch" >/dev/null 2>&1; then
+            fail "Expected a sparse ELF over the parser size cap to be rejected"
+        fi
+    )
 }
 
 make_fake_chrome_upstream_app() {
@@ -11229,6 +11683,7 @@ main() {
     test_browser_use_file_url_policy_patch_behavior
     test_browser_use_site_status_allowlist_fallback_patch_behavior
     test_browser_plugin_renamed_upstream_staging
+    test_browser_plugin_marketplace_source_containment
     test_upstream_bundled_skills_staging
     test_upstream_bundled_skills_validator_guards
     test_upstream_bundled_skills_rejects_unsafe_source
@@ -11242,7 +11697,7 @@ main() {
     test_portable_bundled_plugin_stage_failures
     test_portable_bundled_plugin_marketplace_path_guard
     test_browser_use_node_repl_glibc_pidfd_patch_static
-    test_browser_use_node_repl_ldd_output_compatibility
+    test_browser_use_node_repl_static_elf_compatibility
     test_chrome_plugin_staging
     test_chrome_marketplace_fallback_synthesis
     test_chrome_native_host_manifest_writer

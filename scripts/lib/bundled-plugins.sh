@@ -404,7 +404,11 @@ if expected_machine is None:
     sys.exit(1)
 
 try:
-    header = path.read_bytes()[:20]
+    size = path.stat().st_size
+    if size > 128 * 1024 * 1024:
+        sys.exit(1)
+    with path.open("rb") as source:
+        header = source.read(20)
 except OSError:
     sys.exit(1)
 
@@ -619,9 +623,368 @@ print("patched")
 PY
 }
 
-is_browser_use_node_repl_ldd_output_compatible() {
-    local output="$1"
-    ! printf '%s\n' "$output" | grep -Eq "=> not found|version .* not found"
+validate_browser_use_node_repl_elf_compatibility() {
+    local file="$1"
+    local arch="$2"
+
+    # Parse the staged ELF as data. ldd may execute a target with an unusual
+    # interpreter, so it must never be used on a DMG- or cache-provided binary.
+    python3 - "$file" "$arch" <<'PY'
+import os
+from pathlib import Path
+import re
+import struct
+import sys
+
+
+class ValidationError(Exception):
+    pass
+
+
+def reject(message):
+    raise ValidationError(message)
+
+
+def checked_range(data, offset, size, label):
+    if offset < 0 or size < 0 or offset > len(data) or size > len(data) - offset:
+        reject(f"{label} is outside file bounds")
+
+
+def checked_slice(data, offset, size, label):
+    checked_range(data, offset, size, label)
+    return data[offset : offset + size]
+
+
+def read_cstr(blob, offset, label):
+    if offset < 0 or offset >= len(blob):
+        reject(f"{label} string offset is outside the dynamic string table")
+    end = blob.find(b"\0", offset, min(len(blob), offset + 513))
+    if end < 0:
+        reject(f"{label} is not NUL-terminated within 512 bytes")
+    try:
+        return blob[offset:end].decode("ascii")
+    except UnicodeDecodeError as exc:
+        reject(f"{label} is not ASCII: {exc}")
+
+
+def parse_version(value, prefix):
+    match = re.fullmatch(
+        rf"{re.escape(prefix)}(\d{{1,6}})\.(\d{{1,6}})(?:\.(\d{{1,6}}))?",
+        value,
+    )
+    if match is None:
+        return None
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def elf_hash(value):
+    result = 0
+    for byte in value.encode("ascii"):
+        result = (result << 4) + byte
+        high = result & 0xF0000000
+        if high:
+            result ^= high >> 24
+            result &= ~high
+    return result & 0xFFFFFFFF
+
+
+def validate(path, arch):
+    maximum_size = 128 * 1024 * 1024
+    with path.open("rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        if size > maximum_size:
+            reject("file exceeds the 128 MiB executable limit")
+        data = source.read(maximum_size + 1)
+    if len(data) > maximum_size:
+        reject("file grew beyond the 128 MiB executable limit while being read")
+    if len(data) != size:
+        reject("file size changed while compatibility metadata was being read")
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        reject("file is not a complete ELF executable")
+    if data[4] != 2 or data[5] != 1 or data[6] != 1:
+        reject("only little-endian ELF64 executables are supported")
+
+    architecture = {
+        "x86_64": (62, "/lib64/ld-linux-x86-64.so.2"),
+        "aarch64": (183, "/lib/ld-linux-aarch64.so.1"),
+        "arm64": (183, "/lib/ld-linux-aarch64.so.1"),
+    }.get(arch)
+    if architecture is None:
+        reject(f"static compatibility validation is unavailable for {arch}")
+    expected_machine, expected_interpreter = architecture
+
+    e_type, e_machine, e_version = struct.unpack_from("<HHI", data, 16)
+    if e_type not in (2, 3) or e_machine != expected_machine or e_version != 1:
+        reject("ELF type, architecture, or version does not match the host")
+
+    e_phoff = struct.unpack_from("<Q", data, 32)[0]
+    e_shoff = struct.unpack_from("<Q", data, 40)[0]
+    e_ehsize = struct.unpack_from("<H", data, 52)[0]
+    e_phentsize = struct.unpack_from("<H", data, 54)[0]
+    e_phnum = struct.unpack_from("<H", data, 56)[0]
+    e_shentsize = struct.unpack_from("<H", data, 58)[0]
+    e_shnum = struct.unpack_from("<H", data, 60)[0]
+    e_shstrndx = struct.unpack_from("<H", data, 62)[0]
+    if e_ehsize != 64 or e_phentsize != 56 or not 1 <= e_phnum <= 256:
+        reject("ELF program header table is missing or malformed")
+    if e_shentsize != 64 or not 1 <= e_shnum <= 256 or e_shstrndx >= e_shnum:
+        reject("ELF section header table is missing or malformed")
+    checked_range(data, e_phoff, e_phentsize * e_phnum, "ELF program header table")
+    checked_range(data, e_shoff, e_shentsize * e_shnum, "ELF section header table")
+
+    interpreters = []
+    load_segments = []
+    dynamic_segments = []
+    for index in range(e_phnum):
+        offset = e_phoff + (index * e_phentsize)
+        p_type, _flags, p_offset, _vaddr, _paddr, p_filesz, _memsz, _align = struct.unpack_from(
+            "<IIQQQQQQ", data, offset
+        )
+        checked_range(data, p_offset, p_filesz, f"ELF program segment {index}")
+        if p_filesz > _memsz:
+            reject(f"ELF program segment {index} has a file size larger than its memory size")
+        if p_type == 3:
+            if interpreters or p_filesz != len(expected_interpreter) + 1:
+                reject("ELF contains duplicate or unexpected-sized interpreter metadata")
+            segment = checked_slice(data, p_offset, p_filesz, "ELF interpreter")
+            if not segment.endswith(b"\0") or b"\0" in segment[:-1]:
+                reject("ELF interpreter is not a single NUL-terminated path")
+            try:
+                interpreters.append(segment[:-1].decode("ascii"))
+            except UnicodeDecodeError as exc:
+                reject(f"ELF interpreter is not ASCII: {exc}")
+        elif p_type == 1:
+            load_segments.append((p_offset, _vaddr, p_filesz))
+        elif p_type == 2:
+            dynamic_segments.append((p_offset, _vaddr, p_filesz))
+    if interpreters != [expected_interpreter]:
+        reject(f"unexpected ELF interpreter: {interpreters!r}")
+    if len(dynamic_segments) != 1:
+        reject("ELF must contain exactly one dynamic program segment")
+    if len(load_segments) == 0:
+        reject("ELF has no loadable program segments")
+
+    sections = []
+    for index in range(e_shnum):
+        offset = e_shoff + (index * e_shentsize)
+        fields = struct.unpack_from("<IIQQQQIIQQ", data, offset)
+        section = {
+            "type": fields[1],
+            "address": fields[3],
+            "offset": fields[4],
+            "size": fields[5],
+            "link": fields[6],
+            "entsize": fields[9],
+        }
+        if section["type"] != 8:
+            checked_range(
+                data,
+                section["offset"],
+                section["size"],
+                f"ELF section {index}",
+            )
+        sections.append(section)
+
+    def require_unambiguous_load_mapping(section, label):
+        mappings = []
+        for load_offset, load_address, load_size in load_segments:
+            if (
+                section["address"] >= load_address
+                and section["size"] <= load_size - (section["address"] - load_address)
+            ):
+                mappings.append(load_offset + section["address"] - load_address)
+        if mappings != [section["offset"]]:
+            reject(f"{label} does not have one unambiguous file-backed load mapping")
+
+    dynamic_indexes = [index for index, section in enumerate(sections) if section["type"] == 6]
+    if len(dynamic_indexes) != 1:
+        reject("ELF must contain exactly one dynamic section")
+    dynamic = sections[dynamic_indexes[0]]
+    dynamic_segment_offset, dynamic_segment_address, dynamic_segment_size = dynamic_segments[0]
+    if (
+        dynamic["offset"] != dynamic_segment_offset
+        or dynamic["address"] != dynamic_segment_address
+        or dynamic["size"] != dynamic_segment_size
+        or dynamic["entsize"] != 16
+    ):
+        reject("ELF dynamic section does not exactly match its program segment")
+    require_unambiguous_load_mapping(dynamic, "ELF dynamic section")
+    if dynamic["link"] >= len(sections) or sections[dynamic["link"]]["type"] != 3:
+        reject("ELF dynamic section does not reference a string table")
+    dynstr = sections[dynamic["link"]]
+    if dynstr["size"] > 4 * 1024 * 1024:
+        reject("ELF dynamic string table exceeds the 4 MiB metadata limit")
+    require_unambiguous_load_mapping(dynstr, "ELF dynamic string table")
+    dynstr_data = checked_slice(data, dynstr["offset"], dynstr["size"], "ELF dynamic string table")
+    if dynamic["size"] % dynamic["entsize"] != 0 or dynamic["size"] // 16 > 4096:
+        reject("ELF dynamic section has an invalid entry size")
+
+    dangerous_tags = {
+        15: "RPATH",
+        29: "RUNPATH",
+        0x6FFFFEFB: "DEPAUDIT",
+        0x6FFFFEFC: "AUDIT",
+        0x7FFFFFFD: "AUXILIARY",
+        0x7FFFFFFF: "FILTER",
+    }
+    needed_offsets = []
+    singleton_tags = {
+        5: "STRTAB",
+        10: "STRSZ",
+        0x6FFFFFFE: "VERNEED",
+        0x6FFFFFFF: "VERNEEDNUM",
+    }
+    singleton_values = {}
+    saw_null = False
+    for offset in range(dynamic["offset"], dynamic["offset"] + dynamic["size"], dynamic["entsize"]):
+        tag, value = struct.unpack_from("<qQ", data, offset)
+        if tag == 0:
+            saw_null = True
+            break
+        if tag == 1:
+            needed_offsets.append(value)
+        if tag in dangerous_tags:
+            reject(f"ELF dynamic section contains unsafe {dangerous_tags[tag]}")
+        if tag in singleton_tags:
+            if tag in singleton_values:
+                reject(f"ELF dynamic section contains duplicate {singleton_tags[tag]}")
+            singleton_values[tag] = value
+    if not saw_null:
+        reject("ELF dynamic section has no terminating NULL entry")
+    missing_singletons = [
+        name for tag, name in singleton_tags.items() if tag not in singleton_values
+    ]
+    if missing_singletons:
+        reject("ELF dynamic section is missing " + ", ".join(missing_singletons))
+    if (
+        singleton_values[5] != dynstr["address"]
+        or singleton_values[10] != dynstr["size"]
+    ):
+        reject("loader-visible dynamic string table does not match section metadata")
+
+    needed = [read_cstr(dynstr_data, offset, "DT_NEEDED") for offset in needed_offsets]
+    allowed_needed = {
+        "libgcc_s.so.1",
+        "libm.so.6",
+        "libc.so.6",
+        Path(expected_interpreter).name,
+    }
+    if len(needed) != len(set(needed)):
+        reject("ELF contains duplicate shared-library dependencies")
+    unexpected_needed = sorted(set(needed) - allowed_needed)
+    if unexpected_needed:
+        reject("unexpected shared-library dependencies: " + ", ".join(unexpected_needed))
+    if "libc.so.6" not in needed:
+        reject("ELF does not declare the required libc dependency")
+
+    verneed_indexes = [
+        index for index, section in enumerate(sections) if section["type"] == 0x6FFFFFFE
+    ]
+    if len(verneed_indexes) != 1:
+        reject("ELF must contain exactly one version-needs section")
+    verneed = sections[verneed_indexes[0]]
+    if verneed["link"] != dynamic["link"]:
+        reject("ELF version-needs section does not reference the dynamic string table")
+    if singleton_values[0x6FFFFFFE] != verneed["address"]:
+        reject("loader-visible version-needs table does not match section metadata")
+    if not 1 <= singleton_values[0x6FFFFFFF] <= 256:
+        reject("ELF version-needs record count exceeds the metadata limit")
+    require_unambiguous_load_mapping(verneed, "ELF version-needs section")
+    start = verneed["offset"]
+    end = start + verneed["size"]
+    cursor = start
+    versions = []
+    records = 0
+    total_versions = 0
+    while True:
+        if cursor + 16 > end:
+            reject("ELF version-needs record is outside section bounds")
+        vn_version, vn_count, file_offset, vn_aux, vn_next = struct.unpack_from(
+            "<HHIII", data, cursor
+        )
+        if vn_version != 1 or vn_count == 0 or vn_count > 4096:
+            reject("ELF version-needs record is malformed")
+        total_versions += vn_count
+        if total_versions > 4096:
+            reject("ELF version-needs entries exceed the metadata limit")
+        dependency = read_cstr(dynstr_data, file_offset, "version dependency")
+        if dependency not in needed:
+            reject(f"version-needs record references undeclared dependency {dependency!r}")
+        aux_cursor = cursor + vn_aux
+        if vn_aux < 16 or aux_cursor + 16 > end:
+            reject("ELF version auxiliary table is outside section bounds")
+        for aux_index in range(vn_count):
+            if aux_cursor + 16 > end:
+                reject("ELF version auxiliary record is outside section bounds")
+            version_hash, _flags, _other, name_offset, aux_next = struct.unpack_from(
+                "<IHHII", data, aux_cursor
+            )
+            version_name = read_cstr(dynstr_data, name_offset, "required version")
+            if version_hash != elf_hash(version_name):
+                reject(f"required version {version_name!r} has an invalid ELF hash")
+            versions.append((dependency, version_name))
+            if aux_index + 1 < vn_count:
+                if aux_next < 16 or aux_cursor + aux_next + 16 > end:
+                    reject("ELF version auxiliary chain is malformed")
+                aux_cursor += aux_next
+            elif aux_next != 0:
+                reject("ELF version auxiliary chain exceeds its declared count")
+        records += 1
+        if records > singleton_values[0x6FFFFFFF]:
+            reject("ELF version-needs chain exceeds its declared count")
+        if vn_next == 0:
+            break
+        if vn_next < 16 or cursor + vn_next + 16 > end:
+            reject("ELF version-needs chain is malformed")
+        cursor += vn_next
+
+    if records != singleton_values[0x6FFFFFFF]:
+        reject("ELF version-needs chain does not match its declared count")
+
+    try:
+        host_glibc = os.confstr("CS_GNU_LIBC_VERSION")
+    except (AttributeError, OSError, ValueError) as exc:
+        reject(f"cannot determine host glibc version: {exc}")
+    match = re.fullmatch(r"glibc\s+(\d+)\.(\d+)(?:\.(\d+))?", host_glibc or "")
+    if match is None:
+        reject(f"cannot parse host glibc version {host_glibc!r}")
+    host_glibc_version = tuple(int(part or 0) for part in match.groups())
+
+    allowed_gcc_versions = {"GCC_3.0", "GCC_3.3", "GCC_4.2.0"}
+    glibc_dependencies = {
+        "libc.so.6",
+        "libm.so.6",
+        Path(expected_interpreter).name,
+    }
+    for dependency, version in versions:
+        glibc_version = parse_version(version, "GLIBC_")
+        if glibc_version is not None:
+            if dependency not in glibc_dependencies:
+                reject(f"{dependency} unexpectedly requires {version}")
+            if glibc_version > host_glibc_version:
+                reject(
+                    f"required {version} exceeds host GLIBC_{'.'.join(map(str, host_glibc_version))}"
+                )
+            continue
+        if version == "GLIBC_ABI_DT_RELR":
+            if dependency not in glibc_dependencies:
+                reject(f"{dependency} unexpectedly requires {version}")
+            if host_glibc_version < (2, 36, 0):
+                reject("GLIBC_ABI_DT_RELR requires glibc 2.36 or newer")
+            continue
+        if version in allowed_gcc_versions:
+            if dependency != "libgcc_s.so.1":
+                reject(f"{dependency} unexpectedly requires {version}")
+            continue
+        reject(f"unexpected required symbol version {version!r}")
+
+
+try:
+    validate(Path(sys.argv[1]), sys.argv[2])
+except (OSError, OverflowError, ValueError, struct.error, ValidationError) as exc:
+    print(f"unsafe or incompatible ELF metadata: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
 }
 
 install_browser_use_node_repl_executable_resource() {
@@ -629,7 +992,7 @@ install_browser_use_node_repl_executable_resource() {
     local destination="$2"
     local label="$3"
     local log_level="${4:-warn}"
-    local ldd_output
+    local compatibility_error
     local patch_status
 
     if ! install_linux_executable_resource "$source" "$destination" "$label" "$log_level"; then
@@ -647,17 +1010,17 @@ install_browser_use_node_repl_executable_resource() {
         info "Patched Browser Use $label for glibc 2.34+ compatibility"
     fi
 
-    if command -v ldd >/dev/null 2>&1; then
-        if ! ldd_output="$(ldd "$destination" 2>&1)" \
-            || ! is_browser_use_node_repl_ldd_output_compatible "$ldd_output"; then
-            if [ "$log_level" = "info" ]; then
-                info "Browser Use $label is not compatible with this host runtime; skipping"
-            else
-                warn "Browser Use $label is not compatible with this host runtime; skipping"
-            fi
-            rm -f "$destination"
-            return 1
+    if ! compatibility_error="$(
+        validate_browser_use_node_repl_elf_compatibility "$destination" "$ARCH" 2>&1
+    )"; then
+        if [ "$log_level" = "info" ]; then
+            info "Browser Use $label is not compatible with this host runtime; skipping"
+        else
+            warn "Browser Use $label is not compatible with this host runtime; skipping"
         fi
+        [ -z "$compatibility_error" ] || warn "$compatibility_error"
+        rm -f "$destination"
+        return 1
     fi
 }
 
@@ -1552,28 +1915,149 @@ find_browser_plugin_source() {
 const fs = require("fs");
 const path = require("path");
 
-const bundledRoot = process.argv[2];
+const bundledRoot = path.resolve(process.argv[2]);
 const marketplacePath = process.argv[3];
 const candidates = [];
+
+let realBundledRoot;
+try {
+  const bundledRootMetadata = fs.lstatSync(bundledRoot);
+  if (bundledRootMetadata.isSymbolicLink() || !bundledRootMetadata.isDirectory()) {
+    process.exit(1);
+  }
+  realBundledRoot = fs.realpathSync(bundledRoot);
+} catch (_err) {
+  process.exit(1);
+}
+
+function isStrictlyInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return (
+    relative.length > 0 &&
+    relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(relative)
+  );
+}
+
+function hasSymlinkPathComponent(root, candidate) {
+  const relative = path.relative(root, candidate);
+  let current = root;
+  for (const component of relative.split(path.sep)) {
+    current = path.join(current, component);
+    if (fs.lstatSync(current).isSymbolicLink()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isRegularTree(root) {
+  const pending = [root];
+  let entries = 0;
+  while (pending.length > 0) {
+    const directoryPath = pending.pop();
+    const directory = fs.opendirSync(directoryPath);
+    try {
+      let entry;
+      while ((entry = directory.readSync()) !== null) {
+        entries += 1;
+        if (entries > 100000) {
+          return false;
+        }
+        const entryPath = path.join(directoryPath, entry.name);
+        const metadata = fs.lstatSync(entryPath);
+        if (metadata.isSymbolicLink()) {
+          return false;
+        }
+        if (metadata.isDirectory()) {
+          pending.push(entryPath);
+        } else if (!metadata.isFile()) {
+          return false;
+        }
+      }
+    } finally {
+      directory.closeSync();
+    }
+  }
+  return true;
+}
+
+function resolveContainedPluginDirectory(sourcePath) {
+  if (typeof sourcePath !== "string" || sourcePath.length === 0 || path.isAbsolute(sourcePath)) {
+    return null;
+  }
+
+  const candidate = path.resolve(bundledRoot, sourcePath);
+  if (!isStrictlyInside(bundledRoot, candidate)) {
+    return null;
+  }
+
+  try {
+    const metadata = fs.lstatSync(candidate);
+    const realCandidate = fs.realpathSync(candidate);
+    if (
+      metadata.isSymbolicLink() ||
+      !metadata.isDirectory() ||
+      !isStrictlyInside(realBundledRoot, realCandidate) ||
+      !/^[A-Za-z0-9._-]+$/.test(path.basename(candidate)) ||
+      hasSymlinkPathComponent(bundledRoot, candidate) ||
+      !isRegularTree(candidate)
+    ) {
+      return null;
+    }
+    for (const relativePath of [
+      path.join(".codex-plugin", "plugin.json"),
+      path.join("scripts", "browser-client.mjs"),
+    ]) {
+      const requiredPath = path.join(candidate, relativePath);
+      const requiredMetadata = fs.lstatSync(requiredPath);
+      const realRequiredPath = fs.realpathSync(requiredPath);
+      if (
+        requiredMetadata.isSymbolicLink() ||
+        !requiredMetadata.isFile() ||
+        !isStrictlyInside(realCandidate, realRequiredPath)
+      ) {
+        return null;
+      }
+    }
+    const manifest = JSON.parse(
+      fs.readFileSync(path.join(candidate, ".codex-plugin", "plugin.json"), "utf8"),
+    );
+    if (manifest == null || typeof manifest !== "object" || manifest.name !== "browser") {
+      return null;
+    }
+  } catch (_err) {
+    return null;
+  }
+
+  return candidate;
+}
 
 try {
   const marketplace = JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
   const plugins = Array.isArray(marketplace.plugins) ? marketplace.plugins : [];
-  const plugin = plugins.find((entry) => entry && entry.name === "browser");
-  const source = plugin && plugin.source;
-  if (
-    source &&
-    source.source === "local" &&
-    typeof source.path === "string" &&
-    source.path.length > 0
-  ) {
-    candidates.push(path.resolve(bundledRoot, source.path));
+  for (const plugin of plugins) {
+    if (plugin == null || typeof plugin !== "object" || plugin.name !== "browser") {
+      continue;
+    }
+    const source = plugin.source;
+    if (source == null || source.source !== "local") {
+      continue;
+    }
+    const candidate = resolveContainedPluginDirectory(source.path);
+    if (candidate != null) {
+      candidates.push(candidate);
+    }
   }
 } catch (_err) {
   // Fall back to the known upstream directory name below.
 }
 
-candidates.push(path.join(bundledRoot, "plugins", "browser"));
+const fallback = resolveContainedPluginDirectory("plugins/browser");
+if (fallback != null) {
+  candidates.push(fallback);
+}
 
 const seen = new Set();
 for (const candidate of candidates) {
@@ -1599,11 +2083,15 @@ NODE
 stage_browser_plugin_from_upstream() {
     local source_plugin="$1"
     local target_plugins="$2"
-    local target_name
-    target_name="$(basename "$source_plugin")"
+    local target_name="browser"
     local target_plugin="$target_plugins/$target_name"
     local source_client="$source_plugin/scripts/browser-client.mjs"
     local target_client="$target_plugin/scripts/browser-client.mjs"
+
+    if [ -L "$target_plugins" ] || [ ! -d "$target_plugins" ]; then
+        warn "Browser plugin staging root is missing or is a symlink"
+        return 1
+    fi
 
     if [ ! -d "$source_plugin" ]; then
         info "Browser bundled plugin resources not present in upstream app; skipping Browser"
@@ -1620,8 +2108,15 @@ stage_browser_plugin_from_upstream() {
         return 1
     fi
 
-    rm -rf "$target_plugin"
-    cp -R "$source_plugin" "$target_plugin"
+    if ! rm -rf "$target_plugin"; then
+        warn "Could not replace the staged Browser plugin directory"
+        return 1
+    fi
+    if ! cp -R "$source_plugin" "$target_plugin"; then
+        warn "Could not copy the Browser plugin from upstream resources"
+        rm -rf "$target_plugin" || true
+        return 1
+    fi
     remove_macos_sidecar_files "$target_plugin"
     patch_browser_use_node_repl_process_env_import "$target_client"
     patch_browser_use_node_repl_env_guard "$target_client"
@@ -1647,79 +2142,165 @@ write_bundled_plugins_marketplace() {
     node - "$source" "$destination" "$include_browser" "$include_chrome" "$include_computer_use" "$@" <<'NODE'
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 const sourcePath = process.argv[2];
 const destinationPath = process.argv[3];
+const marketplaceRoot = path.resolve(path.dirname(destinationPath), "..", "..");
 const includeBrowser = process.argv[4] === "1";
 const includeChrome = process.argv[5] === "1";
 const includeComputerUse = process.argv[6] === "1";
 const portablePluginNames = process.argv.slice(7);
 const marketplace = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+if (marketplace == null || typeof marketplace !== "object" || Array.isArray(marketplace)) {
+  throw new Error("Bundled marketplace must be a JSON object");
+}
+if (marketplace.plugins != null && !Array.isArray(marketplace.plugins)) {
+  throw new Error("Bundled marketplace plugins must be an array");
+}
 const sourcePlugins = marketplace.plugins || [];
 const plugins = [];
 
 if (includeBrowser) {
-  const marketplaceRoot = path.resolve(path.dirname(destinationPath), "..", "..");
-  const browser = sourcePlugins.find((plugin) => {
-    if (plugin == null || typeof plugin !== "object") {
-      return false;
+  const marketplacePluginsRoot = path.join(marketplaceRoot, "plugins");
+  let realMarketplacePluginsRoot;
+  try {
+    const marketplaceRootMetadata = fs.lstatSync(marketplaceRoot);
+    const marketplacePluginsMetadata = fs.lstatSync(marketplacePluginsRoot);
+    if (
+      marketplaceRootMetadata.isSymbolicLink() ||
+      !marketplaceRootMetadata.isDirectory() ||
+      marketplacePluginsMetadata.isSymbolicLink() ||
+      !marketplacePluginsMetadata.isDirectory()
+    ) {
+      throw new Error("unsafe staged marketplace root");
     }
-    if (plugin.name !== "browser") {
-      return false;
-    }
-    const source = plugin.source || {};
-    if (source.source !== "local" || typeof source.path !== "string") {
-      return true;
-    }
-    const stagedManifest = path.join(
-      path.resolve(marketplaceRoot, source.path),
-      ".codex-plugin",
-      "plugin.json",
-    );
-    return fs.existsSync(stagedManifest);
-  });
-  if (browser == null) {
-    let fallback = null;
-    const stagedManifestPath = path.join(
-      marketplaceRoot,
-      "plugins",
-      "browser",
-      ".codex-plugin",
-      "plugin.json",
-    );
-    try {
-      const manifest = JSON.parse(fs.readFileSync(stagedManifestPath, "utf8"));
-      const name =
-        typeof manifest.name === "string" && manifest.name.length > 0 ? manifest.name : "browser";
-      const category =
-        manifest &&
-        manifest.interface &&
-        typeof manifest.interface.category === "string" &&
-        manifest.interface.category.length > 0
-          ? manifest.interface.category
-          : "Engineering";
-      fallback = {
-        name,
-        source: {
-          source: "local",
-          path: "./plugins/browser",
-        },
-        policy: {
-          installation: "AVAILABLE",
-          authentication: "ON_INSTALL",
-        },
-        category,
-      };
-    } catch (_err) {
-      // Fall through to the explicit error below.
-    }
-    if (fallback == null) {
-      throw new Error("Bundled marketplace does not contain browser plugin");
-    }
-    plugins.push(fallback);
-  } else {
-    plugins.push(browser);
+    realMarketplacePluginsRoot = fs.realpathSync(marketplacePluginsRoot);
+  } catch (_err) {
+    realMarketplacePluginsRoot = null;
   }
+  const isStrictlyInside = (root, candidate) => {
+    const relative = path.relative(root, candidate);
+    return (
+      relative.length > 0 &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`) &&
+      !path.isAbsolute(relative)
+    );
+  };
+  const isRegularTree = (root) => {
+    const pending = [root];
+    let entries = 0;
+    while (pending.length > 0) {
+      const directoryPath = pending.pop();
+      const directory = fs.opendirSync(directoryPath);
+      try {
+        let entry;
+        while ((entry = directory.readSync()) !== null) {
+          entries += 1;
+          if (entries > 100000) {
+            return false;
+          }
+          const entryPath = path.join(directoryPath, entry.name);
+          const metadata = fs.lstatSync(entryPath);
+          if (metadata.isSymbolicLink()) {
+            return false;
+          }
+          if (metadata.isDirectory()) {
+            pending.push(entryPath);
+          } else if (!metadata.isFile()) {
+            return false;
+          }
+        }
+      } finally {
+        directory.closeSync();
+      }
+    }
+    return true;
+  };
+  const resolveStagedPluginDirectory = (sourcePath) => {
+    if (
+      realMarketplacePluginsRoot == null ||
+      typeof sourcePath !== "string" ||
+      sourcePath.length === 0 ||
+      path.isAbsolute(sourcePath)
+    ) {
+      return null;
+    }
+    const candidate = path.resolve(marketplaceRoot, sourcePath);
+    if (!isStrictlyInside(marketplacePluginsRoot, candidate)) {
+      return null;
+    }
+    try {
+      const metadata = fs.lstatSync(candidate);
+      const realCandidate = fs.realpathSync(candidate);
+      if (
+        metadata.isSymbolicLink() ||
+        !metadata.isDirectory() ||
+        !isStrictlyInside(realMarketplacePluginsRoot, realCandidate) ||
+        !/^[A-Za-z0-9._-]+$/.test(path.basename(candidate)) ||
+        !isRegularTree(candidate)
+      ) {
+        return null;
+      }
+      for (const relativePath of [
+        path.join(".codex-plugin", "plugin.json"),
+        path.join("scripts", "browser-client.mjs"),
+      ]) {
+        const requiredPath = path.join(candidate, relativePath);
+        const requiredMetadata = fs.lstatSync(requiredPath);
+        const realRequiredPath = fs.realpathSync(requiredPath);
+        if (
+          requiredMetadata.isSymbolicLink() ||
+          !requiredMetadata.isFile() ||
+          !isStrictlyInside(realCandidate, realRequiredPath)
+        ) {
+          return null;
+        }
+      }
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(candidate, ".codex-plugin", "plugin.json"), "utf8"),
+      );
+      if (manifest == null || typeof manifest !== "object" || manifest.name !== "browser") {
+        return null;
+      }
+    } catch (_err) {
+      return null;
+    }
+    return candidate;
+  };
+  const stagedBrowserDirectory = resolveStagedPluginDirectory(
+    "./plugins/browser",
+  );
+  if (stagedBrowserDirectory == null) {
+    throw new Error("Staged Browser plugin path is missing or unsafe");
+  }
+  const stagedManifestPath = path.join(
+    stagedBrowserDirectory,
+    ".codex-plugin",
+    "plugin.json",
+  );
+  const manifest = JSON.parse(fs.readFileSync(stagedManifestPath, "utf8"));
+  const category =
+    manifest &&
+    manifest.interface &&
+    typeof manifest.interface.category === "string" &&
+    manifest.interface.category.length > 0 &&
+    manifest.interface.category.length <= 128
+      ? manifest.interface.category
+      : "Engineering";
+  plugins.push({
+    name: "browser",
+    source: {
+      source: "local",
+      path: "./plugins/browser",
+    },
+    policy: {
+      installation: "AVAILABLE",
+      authentication: "ON_INSTALL",
+    },
+    category,
+  });
 }
 
 if (includeChrome) {
@@ -1815,8 +2396,60 @@ plugins.sort((left, right) => {
 });
 
 marketplace.plugins = plugins;
-fs.mkdirSync(path.dirname(destinationPath), { recursive: true });
-fs.writeFileSync(destinationPath, `${JSON.stringify(marketplace, null, 2)}\n`);
+const destinationDirectory = path.join(marketplaceRoot, ".agents", "plugins");
+const expectedDestinationPath = path.join(destinationDirectory, "marketplace.json");
+if (path.resolve(destinationPath) !== expectedDestinationPath) {
+  throw new Error("Bundled marketplace destination path is outside its fixed staging location");
+}
+const marketplaceRootParent = path.dirname(marketplaceRoot);
+const marketplaceRootParentMetadata = fs.lstatSync(marketplaceRootParent);
+if (
+  marketplaceRootParentMetadata.isSymbolicLink() ||
+  !marketplaceRootParentMetadata.isDirectory()
+) {
+  throw new Error("Bundled marketplace destination parent is unsafe");
+}
+for (const directoryPath of [
+  marketplaceRoot,
+  path.join(marketplaceRoot, ".agents"),
+  destinationDirectory,
+]) {
+  try {
+    const metadata = fs.lstatSync(directoryPath);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error(`Unsafe bundled marketplace destination directory: ${directoryPath}`);
+    }
+  } catch (error) {
+    if (error?.code !== "ENOENT") {
+      throw error;
+    }
+    fs.mkdirSync(directoryPath, { mode: 0o755 });
+  }
+}
+try {
+  const metadata = fs.lstatSync(destinationPath);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error("Bundled marketplace destination must be a regular file");
+  }
+} catch (error) {
+  if (error?.code !== "ENOENT") {
+    throw error;
+  }
+}
+const temporaryPath = path.join(
+  destinationDirectory,
+  `.marketplace.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`,
+);
+try {
+  fs.writeFileSync(temporaryPath, `${JSON.stringify(marketplace, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o644,
+  });
+  fs.renameSync(temporaryPath, destinationPath);
+} finally {
+  fs.rmSync(temporaryPath, { force: true });
+}
 NODE
 }
 

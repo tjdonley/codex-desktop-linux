@@ -63,11 +63,36 @@ test("descriptor factories validate the fresh descriptor contract", () => {
     /must define assetPattern or pattern/,
   );
   assert.throws(
+    () => webviewAssetPatch({
+      id: "invalid-asset-match",
+      pattern: /^app-.*\.js$/,
+      assetMatch: "current contract",
+      apply: (source) => source,
+    }),
+    /assetMatch must be a function/,
+  );
+  assert.throws(
     () => extractedAppPatch({ id: "old-extracted", phase: "extracted-app", apply: () => ({ changed: false }) }),
     /must use phase 'extracted-app:pre-webview' or 'extracted-app:post-webview'/,
   );
   assert.throws(
     () => mainBundlePatch({ id: "bad-policy", ciPolicy: "legacy", apply: (source) => source }),
     /unsupported ciPolicy 'legacy'/,
+  );
+  assert.throws(
+    () => mainBundlePatch({ id: "bad-composition", composesPatches: "linux-owner", apply: (source) => source }),
+    /composesPatches must be a non-empty array/,
+  );
+  assert.throws(
+    () => mainBundlePatch({ id: "bad-owner", composesPatches: ["feature:owner"], apply: (source) => source }),
+    /composesPatches entries must match/,
+  );
+  assert.throws(
+    () => mainBundlePatch({
+      id: "duplicate-owner",
+      composesPatches: ["linux-owner", "linux-owner"],
+      apply: (source) => source,
+    }),
+    /composesPatches must not contain duplicates/,
   );
 });

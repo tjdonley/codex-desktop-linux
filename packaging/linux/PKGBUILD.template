@@ -37,6 +37,7 @@ depends=(
     'nspr'
     'nss'
     'pango'
+__LINUX_FEATURE_DEPENDENCIES__
 )
 optdepends=(
     'nodejs>=22.22.0: optional override for the bundled managed Node.js runtime'
@@ -50,5 +51,5 @@ source=()
 sha256sums=()
 
 package() {
-    cp -a "__STAGING_DIR__/." "${pkgdir}/"
+    cp -a --no-preserve=ownership "__STAGING_DIR__/." "${pkgdir}/"
 }

@@ -768,6 +768,170 @@ remove_macos_sidecar_files() {
     find "$root" -type f -name '*:com.apple.*' -delete
 }
 
+validate_upstream_bundled_skills() {
+    local skills_dir="$1"
+
+    python3 - "$skills_dir" <<'PY'
+import os
+from pathlib import Path
+import stat
+import sys
+
+root = Path(sys.argv[1])
+
+try:
+    root_metadata = root.lstat()
+except OSError as exc:
+    print(f"cannot inspect bundled skills root: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if stat.S_ISLNK(root_metadata.st_mode):
+    print("bundled skills root cannot be a symlink", file=sys.stderr)
+    sys.exit(1)
+if not stat.S_ISDIR(root_metadata.st_mode):
+    print("bundled skills root must be a directory", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    resolved_root = root.resolve(strict=True)
+except (OSError, RuntimeError) as exc:
+    print(f"cannot resolve bundled skills root: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
+def fail_walk(error):
+    print(f"cannot inspect bundled skills tree: {error}", file=sys.stderr)
+    sys.exit(1)
+
+
+for current_root, directories, files in os.walk(root, followlinks=False, onerror=fail_walk):
+    current = Path(current_root)
+    for name in directories + files:
+        path = current / name
+        relative_path = path.relative_to(root)
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            print(f"cannot inspect {relative_path}: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        if stat.S_ISLNK(metadata.st_mode):
+            try:
+                target = os.readlink(path)
+            except OSError as exc:
+                print(f"cannot read symlink {relative_path}: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if os.path.isabs(target):
+                print(f"absolute symlink is not allowed: {relative_path}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                resolved_target = path.resolve(strict=True)
+            except (OSError, RuntimeError) as exc:
+                print(f"cannot resolve symlink {relative_path}: {exc}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                resolved_target.relative_to(resolved_root)
+            except ValueError:
+                print(f"symlink escapes bundled skills root: {relative_path}", file=sys.stderr)
+                sys.exit(1)
+            try:
+                target_metadata = resolved_target.stat()
+            except OSError as exc:
+                print(f"cannot inspect symlink target {relative_path}: {exc}", file=sys.stderr)
+                sys.exit(1)
+            if not (stat.S_ISDIR(target_metadata.st_mode) or stat.S_ISREG(target_metadata.st_mode)):
+                print(f"unsupported symlink target type: {relative_path}", file=sys.stderr)
+                sys.exit(1)
+            continue
+
+        if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+            print(f"unsupported file type: {relative_path}", file=sys.stderr)
+            sys.exit(1)
+        if metadata.st_mode & 0o6000:
+            print(f"privileged mode is not allowed: {relative_path}", file=sys.stderr)
+            sys.exit(1)
+PY
+}
+
+stage_upstream_bundled_skills() {
+    local source_skills="$1"
+    local target_skills="$2"
+    local target_parent
+    local staging_skills=""
+    local backup_skills=""
+
+    if [ ! -d "$source_skills" ]; then
+        info "Bundled skills not present in upstream resources; skipping"
+        return 0
+    fi
+    if ! validate_upstream_bundled_skills "$source_skills"; then
+        warn "Bundled skills source contains unsupported content"
+        return 1
+    fi
+
+    target_parent="$(dirname "$target_skills")"
+    mkdir -p "$target_parent"
+    if ! staging_skills="$(mktemp -d "$target_parent/.skills.tmp.XXXXXX")"; then
+        warn "Failed to create staging directory for bundled skills"
+        return 1
+    fi
+    if ! cp -R "$source_skills/." "$staging_skills/"; then
+        rm -rf -- "$staging_skills"
+        warn "Failed to stage bundled skills from upstream resources"
+        return 1
+    fi
+    if ! remove_macos_sidecar_files "$staging_skills"; then
+        rm -rf -- "$staging_skills"
+        warn "Failed to clean macOS sidecar files from bundled skills"
+        return 1
+    fi
+    if ! validate_upstream_bundled_skills "$staging_skills"; then
+        rm -rf -- "$staging_skills" || warn "Failed to clean bundled skills staging directory"
+        warn "Bundled skills failed post-copy validation"
+        return 1
+    fi
+    if ! chmod -R u+rwX,go-w "$staging_skills"; then
+        rm -rf -- "$staging_skills"
+        warn "Failed to normalize bundled skills permissions"
+        return 1
+    fi
+
+    backup_skills="$target_parent/.skills.backup.$$"
+    if ! rm -rf -- "$backup_skills"; then
+        rm -rf -- "$staging_skills"
+        warn "Failed to prepare bundled skills backup"
+        return 1
+    fi
+    if [ -e "$target_skills" ] || [ -L "$target_skills" ]; then
+        if ! mv -- "$target_skills" "$backup_skills"; then
+            rm -rf -- "$staging_skills"
+            warn "Failed to preserve existing bundled skills"
+            return 1
+        fi
+    else
+        backup_skills=""
+    fi
+    if ! mv -- "$staging_skills" "$target_skills"; then
+        rm -rf -- "$staging_skills"
+        if [ -n "$backup_skills" ]; then
+            if mv -- "$backup_skills" "$target_skills"; then
+                warn "Failed to install bundled skills; previous target was restored"
+            else
+                warn "Failed to install bundled skills and previous target could not be restored"
+            fi
+        else
+            warn "Failed to install bundled skills"
+        fi
+        return 1
+    fi
+    if [ -n "$backup_skills" ] && ! rm -rf -- "$backup_skills"; then
+        warn "Failed to clean previous bundled skills backup: $backup_skills"
+        return 1
+    fi
+
+    info "Bundled skills staged from upstream DMG"
+}
+
 chrome_extension_host_arch() {
     case "$ARCH" in
         x86_64) echo "x64" ;;
@@ -857,6 +1021,55 @@ patch_browser_client_iab_socket_scope() {
     fi
 }
 
+patch_browser_client_linux_socket_dir() {
+    local client="$1"
+    local patcher="$SCRIPT_DIR/scripts/lib/patch-browser-client-iab-socket-scope.js"
+
+    if [ ! -f "$patcher" ]; then
+        warn "Browser socket-directory patch helper not found at $patcher; leaving browser-client.mjs unchanged"
+        return 0
+    fi
+
+    if ! node "$patcher" "$client" --socket-dir-only >&2; then
+        warn "Browser socket-directory patch helper failed; leaving browser-client.mjs unchanged"
+    fi
+}
+
+patch_browser_use_node_repl_process_env_import() {
+    local client="$1"
+
+    if grep -q "codexLinuxBrowserUseProcessEnv" "$client"; then
+        return 0
+    fi
+
+    python3 - "$client" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+pattern = re.compile(
+    r'import\{env as (?P<binding>[A-Za-z_$][\w$]*)\}from"node:process";'
+)
+match = pattern.search(source)
+if match is None:
+    if '"node:process"' in source:
+        print(
+            "WARN: Could not find Browser Use node:process env import — leaving browser-client.mjs unchanged",
+            file=sys.stderr,
+        )
+    raise SystemExit(0)
+
+binding = match.group("binding")
+replacement = (
+    "var codexLinuxBrowserUseProcessEnv=globalThis.nodeRepl?.env??{},"
+    f"{binding}=codexLinuxBrowserUseProcessEnv;"
+)
+path.write_text(source[:match.start()] + replacement + source[match.end():], encoding="utf-8")
+PY
+}
+
 normalize_plugin_script_executable_modes() {
     local target_plugin="$1"
     local scripts_dir="$target_plugin/scripts"
@@ -898,10 +1111,12 @@ stage_chrome_plugin_from_upstream() {
     cp -R "$source_plugin" "$target_plugin"
     remove_macos_sidecar_files "$target_plugin"
     patch_chrome_plugin_for_linux "$target_plugin"
+    patch_browser_use_node_repl_process_env_import "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_node_repl_env_guard "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_node_repl_config_shim "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_native_pipe_import_meta_bridge "$target_plugin/scripts/browser-client.mjs"
     patch_browser_use_site_status_allowlist_fallback "$target_plugin/scripts/browser-client.mjs"
+    patch_browser_client_linux_socket_dir "$target_plugin/scripts/browser-client.mjs"
     normalize_plugin_script_executable_modes "$target_plugin"
     if ! install_chrome_extension_host_resource "$target_plugin"; then
         rm -rf "$target_plugin"
@@ -926,33 +1141,17 @@ import sys
 
 path = Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
-patterns = [
-    re.compile(
-        r'async fetchBlocked\((?P<url>[A-Za-z_$][\w$]*)\)\{'
-        r'let (?P<response>[A-Za-z_$][\w$]*)=await (?P<fetch>[A-Za-z_$][\w$]*)'
-        r'\((?P=url)\.endpoint,\{method:"GET"\}\);'
-        r'if\(!(?P=response)\.ok\)throw new Error\((?P<format>[A-Za-z_$][\w$]*)'
-        r'\(`Browser Use cannot determine if \$\{(?P=url)\.displayUrl\} is allowed\. '
-        r'Please try again later or use another source\.`\)\);'
-        r'let (?P<json>[A-Za-z_$][\w$]*)=await (?P=response)\.json\(\);'
-        r'return (?P<status>[A-Za-z_$][\w$]*)\((?P=json)\)\}'
-    ),
-    re.compile(
-        r'async fetchBlocked\((?P<url>[A-Za-z_$][\w$]*),(?P<label>[A-Za-z_$][\w$]*)\)\{'
-        r'let (?P<response>[A-Za-z_$][\w$]*)=await (?P<fetch>[A-Za-z_$][\w$]*)'
-        r'\((?P=url)\.endpoint,\{method:"GET"\}\);'
-        r'if\(!(?P=response)\.ok\)throw new Error\((?P<format>[A-Za-z_$][\w$]*)'
-        r'\(`\$\{(?P=label)\} cannot determine if \$\{(?P=url)\.displayUrl\} is allowed\. '
-        r'Please try again later or use another source\.`\)\);'
-        r'let (?P<json>[A-Za-z_$][\w$]*)=await (?P=response)\.json\(\);'
-        r'return (?P<status>[A-Za-z_$][\w$]*)\((?P=json)\)\}'
-    ),
-]
-match = None
-for pattern in patterns:
-    match = pattern.search(source)
-    if match is not None:
-        break
+pattern = re.compile(
+    r'async fetchBlocked\((?P<url>[A-Za-z_$][\w$]*),(?P<label>[A-Za-z_$][\w$]*)\)\{'
+    r'let (?P<response>[A-Za-z_$][\w$]*)=await (?P<fetch>[A-Za-z_$][\w$]*)'
+    r'\((?P=url)\.endpoint,\{method:"GET"\}\);'
+    r'if\(!(?P=response)\.ok\)throw new Error\((?P<format>[A-Za-z_$][\w$]*)'
+    r'\(`\$\{(?P=label)\} cannot determine if \$\{(?P=url)\.displayUrl\} is allowed\. '
+    r'Please try again later or use another source\.`\)\);'
+    r'let (?P<json>[A-Za-z_$][\w$]*)=await (?P=response)\.json\(\);'
+    r'return (?P<status>[A-Za-z_$][\w$]*)\((?P=json)\)\}'
+)
+match = pattern.search(source)
 if match is None:
     if "/aura/site_status" not in source and "fetchBlocked(" not in source:
         raise SystemExit(0)
@@ -968,19 +1167,14 @@ fetch = match.group("fetch")
 formatter = match.group("format")
 json_value = match.group("json")
 status = match.group("status")
-label = match.groupdict().get("label")
+label = match.group("label")
 error = "__codexLinuxErr"
-error_message = (
-    f'Browser Use cannot determine if ${{{url}.displayUrl}} is allowed. Please try again later or use another source.'
-    if label is None
-    else f'${{{label}}} cannot determine if ${{{url}.displayUrl}} is allowed. Please try again later or use another source.'
-)
-args = url if label is None else f"{url},{label}"
+error_message = f'${{{label}}} cannot determine if ${{{url}.displayUrl}} is allowed. Please try again later or use another source.'
 replacement = (
-    f'async fetchBlocked({args}){{let {response};try{{{response}=await {fetch}({url}.endpoint,{{method:"GET"}})}}'
+    f'async fetchBlocked({url},{label}){{let {response};try{{{response}=await {fetch}({url}.endpoint,{{method:"GET"}})}}'
     f'catch({error}){{if(String({url}?.endpoint??"").includes("/aura/site_status")&&'
-    f'String({error}?.message??{error}).toLowerCase().includes("allowlist"))return console.warn'
-    f'("codexLinuxSiteStatusAllowlistFallback",{url}.endpoint),!1;throw {error}}}'
+    f'String({error}?.message??{error}).toLowerCase().includes("allowlist"))'
+    f'return!1/*codexLinuxSiteStatusAllowlistFallback*/;throw {error}}}'
     f'if(!{response}.ok)throw new Error({formatter}(`{error_message}`));'
     f'let {json_value}=await {response}.json();return {status}({json_value})}}'
 )
@@ -1059,7 +1253,7 @@ PY
 patch_browser_use_node_repl_env_guard() {
     local client="$1"
 
-    if grep -Eq 'globalThis\.nodeRepl\?\.env\?\.\[[^]]+\]' "$client"; then
+    if grep -q "codexLinuxBrowserUseNodeReplEnvGuard" "$client"; then
         return 0
     fi
 
@@ -1070,28 +1264,53 @@ import sys
 
 path = Path(sys.argv[1])
 source = path.read_text(encoding="utf-8")
-pattern = re.compile(
+helper_pattern = re.compile(
     r'function (?P<helper>[A-Za-z_$][\w$]*)\((?P<key>[A-Za-z_$][\w$]*)\)\{'
     r'let (?P<value>[A-Za-z_$][\w$]*)=globalThis\.nodeRepl\?\.env\[(?P=key)\];'
     r'return typeof (?P=value)=="string"\?(?P=value):void 0\}'
 )
-match = pattern.search(source)
-if match is None:
+helper_match = helper_pattern.search(source)
+if helper_match is not None:
+    helper = helper_match.group("helper")
+    key = helper_match.group("key")
+    value = helper_match.group("value")
+    replacement = (
+        f'function {helper}({key}){{'
+        f'let {value}=globalThis.nodeRepl?.env?.[{key}];'
+        f'return typeof {value}=="string"?{value}:void 0}}'
+    )
+    source = source[:helper_match.start()] + replacement + source[helper_match.end():]
+
+# Newer Browser clients snapshot privileged node_repl state before creating the
+# browser agent. Older Linux node_repl runtimes do not expose `env`, so every
+# direct property read must preserve the upstream default behavior when it is
+# absent. Keep the object identity comparison itself unchanged.
+direct_env_pattern = re.compile(
+    r'(?P<object>\b[A-Za-z_$][\w$]*)\.env\[(?P<key>[^\]]+)\]'
+)
+source, direct_env_count = direct_env_pattern.subn(
+    r'\g<object>.env?.[\g<key>]',
+    source,
+)
+
+if helper_match is None and direct_env_count == 0:
     print(
         "WARN: Could not find Browser Use nodeRepl env guard insertion point — leaving browser-client.mjs unchanged",
         file=sys.stderr,
     )
     raise SystemExit(0)
 
-helper = match.group("helper")
-key = match.group("key")
-value = match.group("value")
-replacement = (
-    f'function {helper}({key}){{'
-    f'let {value}=globalThis.nodeRepl?.env?.[{key}];'
-    f'return typeof {value}=="string"?{value}:void 0}}'
+marker_target = (
+    "globalThis.nodeRepl?.env?.["
+    if "globalThis.nodeRepl?.env?.[" in source
+    else ".env?.["
 )
-path.write_text(source[:match.start()] + replacement + source[match.end():], encoding="utf-8")
+source = source.replace(
+    marker_target,
+    f"/*codexLinuxBrowserUseNodeReplEnvGuard*/{marker_target}",
+    1,
+)
+path.write_text(source, encoding="utf-8")
 PY
 }
 
@@ -1127,7 +1346,9 @@ value = match.group("value")
 shim = r'''
 function codexLinuxBrowserUseConfigShim() {
   let repl = globalThis.nodeRepl;
-  if (repl == null || repl.config != null) return;
+  if (repl == null) return;
+  codexLinuxBrowserUseNodeReplMethodShim(repl);
+  if (repl.config != null) return;
   let config = {
     read: async () => ({ config: await codexLinuxBrowserUseReadToml("config.toml") }),
     readRequirements: async () => ({ requirements: null }),
@@ -1148,6 +1369,30 @@ function codexLinuxBrowserUseConfigShim() {
       Object.defineProperty(prototype, "config", {
         configurable: true,
         get: () => config,
+      });
+    }
+  } catch {}
+}
+
+function codexLinuxBrowserUseNodeReplMethodShim(repl) {
+  // Older Linux node_repl builds do not expose browser notification hooks.
+  codexLinuxBrowserUseDefineNodeReplMethod(repl, "addAfterSubmittedCodeHook", () => () => undefined);
+}
+
+function codexLinuxBrowserUseDefineNodeReplMethod(repl, name, value) {
+  if (typeof repl?.[name] == "function") return;
+
+  try {
+    repl[name] = value;
+    if (typeof repl[name] == "function") return;
+  } catch {}
+
+  try {
+    let prototype = Object.getPrototypeOf(repl);
+    if (prototype != null && Object.getOwnPropertyDescriptor(prototype, name) == null) {
+      Object.defineProperty(prototype, name, {
+        configurable: true,
+        value,
       });
     }
   } catch {}
@@ -1378,6 +1623,7 @@ stage_browser_plugin_from_upstream() {
     rm -rf "$target_plugin"
     cp -R "$source_plugin" "$target_plugin"
     remove_macos_sidecar_files "$target_plugin"
+    patch_browser_use_node_repl_process_env_import "$target_client"
     patch_browser_use_node_repl_env_guard "$target_client"
     patch_browser_use_node_repl_config_shim "$target_client"
     patch_browser_use_native_pipe_import_meta_bridge "$target_client"
@@ -1574,6 +1820,15 @@ fs.writeFileSync(destinationPath, `${JSON.stringify(marketplace, null, 2)}\n`);
 NODE
 }
 
+harden_bundled_plugin_source_tree() {
+    local resources_dir="$INSTALL_DIR/resources"
+    local bundled_plugins_dir="$resources_dir/plugins/openai-bundled"
+
+    [ -d "$bundled_plugins_dir" ] || return 0
+    chmod go-w "$INSTALL_DIR" "$resources_dir" "$resources_dir/plugins"
+    chmod -R u+rwX,go-w "$bundled_plugins_dir"
+}
+
 install_bundled_plugin_resources() {
     local app_dir="$1"
     local upstream_resources="$app_dir/Contents/Resources"
@@ -1588,6 +1843,10 @@ install_bundled_plugin_resources() {
     local include_computer_use=0
     local portable_plugin_names=""
     local portable_plugins=()
+
+    if ! stage_upstream_bundled_skills "$upstream_resources/skills" "$resources_dir/skills"; then
+        return 1
+    fi
 
     if [ ! -f "$source_marketplace" ]; then
         warn "Bundled plugin marketplace not found in upstream app; skipping bundled plugins"
@@ -1642,11 +1901,6 @@ install_bundled_plugin_resources() {
 
     install_linux_executable_resource "$upstream_resources/node" "$resources_dir/node" "node runtime" "info" || true
     install_browser_use_node_repl_resource "$upstream_resources" "$resources_dir/node_repl" || true
-
-    # These files become the trust root for user-cache refreshes at runtime.
-    # Normalize them while staging from the accepted DMG instead of blessing a
-    # potentially modified installed tree during launcher startup.
-    chmod -R u+rwX,go-w "$bundled_plugins_dir"
 
     info "Linux-safe bundled plugins installed"
 }

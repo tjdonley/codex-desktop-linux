@@ -72,6 +72,24 @@ test("rejects required patch and post-patch integrity failures", () => withFixtu
   assert.ok(decision.blockers.some((item) => item.code === "post-patch-integrity"));
 }));
 
+test("rejects a fatal descriptor integrity failure regardless of optional policy", () => withFixture(({ root, dmg }) => {
+  const core = requiredCoreReport();
+  core.patches.push(patch("optional-transaction", {
+    status: "failed-integrity",
+    ciPolicy: "optional",
+    reason: "rollback could not restore original bytes",
+  }));
+  const decision = evaluate(root, dmg, { core });
+  assert.equal(decision.verdict, "rejected");
+  assert.ok(
+    decision.blockers.some(
+      (item) =>
+        item.name === "optional-transaction" &&
+        item.reason.includes("failed-integrity"),
+    ),
+  );
+}));
+
 test("rejects drift from a user-enabled feature", () => withFixture(({ root, dmg }) => {
   const core = requiredCoreReport();
   core.enabledFeatures = ["ui-tweaks"];
@@ -149,6 +167,31 @@ test("a structured rejection wins over incomplete checks", () => withFixture(({ 
   assert.equal(decision.verdict, "rejected");
 }));
 
+test("preserves packaged builder source metadata when a build fails before build info", () => withFixture(({ root, dmg }) => {
+  const commit = "a".repeat(40);
+  writeJson(root, ".codex-linux/source-info.json", {
+    commit,
+    shortCommit: commit.slice(0, 12),
+    version: "0.10.1",
+    branch: "main",
+    remote: "https://github.com/ilysenko/codex-desktop-linux.git",
+    provenance: "packaged-update-builder",
+  });
+  const core = requiredCoreReport();
+  core.patches[0].status = "failed-required";
+  core.patches[0].reason = "current upstream contract did not match";
+
+  const decision = evaluate(root, dmg, {
+    core,
+    buildStatus: "failure",
+  });
+
+  assert.equal(decision.verdict, "rejected");
+  assert.equal(decision.source?.commit, commit);
+  assert.equal(decision.source?.version, "0.10.1");
+  assert.equal(decision.source?.provenance, "packaged-update-builder");
+}));
+
 test("HTTP identity requires an ETag or Last-Modified plus Content-Length", () => {
   assert.equal(httpIdentity({ contentLength: 42 }), null);
   assert.equal(httpIdentity({ lastModified: "today" }), null);
@@ -167,4 +210,84 @@ test("upstream workflow concurrency is isolated per PR or ref", () => {
     /group: upstream-dmg-acceptance-\$\{\{ github\.event_name \}\}-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/,
   );
   assert.doesNotMatch(workflow, /group: upstream-dmg-acceptance-\$\{\{ github\.event_name \}\}\s*$/m);
+  assert.equal((workflow.match(/- linux-features\/\*\*/g) ?? []).length, 2);
+  assert.equal((workflow.match(/- scripts\/lib\/linux-features\.js/g) ?? []).length, 2);
+  assert.doesNotMatch(workflow, /uses:\s+[^\s]+@v\d/);
+  assert.match(workflow, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/);
+  assert.match(workflow, /persist-credentials: false/);
+});
+
+test("Nix refresh serializes campaigns and deduplicates refresh and exact-head CI", () => {
+  const workflow = fs.readFileSync(
+    path.resolve(__dirname, "../../.github/workflows/update-codex-hash.yml"),
+    "utf8",
+  );
+
+  assert.match(workflow, /expected_main_sha:/);
+  assert.match(workflow, /expected_dmg_sha256:/);
+  assert.match(workflow, /run-name: Nix refresh \$\{\{ inputs\.expected_main_sha \}\}:\$\{\{ inputs\.expected_dmg_sha256 \}\}/);
+  assert.match(workflow, /ref: \$\{\{ inputs\.expected_main_sha \}\}/);
+  assert.equal((workflow.match(/required: true/g) ?? []).length, 2);
+  assert.doesNotMatch(workflow, /schedule:/);
+  assert.doesNotMatch(workflow, /cron:/);
+  assert.match(workflow, /group: update-nix-upstream-hashes/);
+  assert.match(workflow, /cancel-in-progress: false/);
+  assert.match(workflow, /Source-Main-SHA:/);
+  assert.match(workflow, /Source-Main-SHA: \$EXPECTED_MAIN_SHA/);
+  assert.match(workflow, /Upstream-DMG-SHA256:/);
+  assert.match(workflow, /git push --force-with-lease origin "\$REFRESH_BRANCH"/);
+  assert.match(workflow, /Exact-head CI already exists/);
+  assert.doesNotMatch(workflow, /git push --force origin "\$REFRESH_BRANCH"/);
+});
+
+test("Nix hash refresh accepts a validated focused output override", () => {
+  const script = fs.readFileSync(
+    path.resolve(__dirname, "update-nix-hashes.sh"),
+    "utf8",
+  );
+  const workflow = fs.readFileSync(
+    path.resolve(__dirname, "../../.github/workflows/ci.yml"),
+    "utf8",
+  );
+  const refreshWorkflow = fs.readFileSync(
+    path.resolve(__dirname, "../../.github/workflows/update-codex-hash.yml"),
+    "utf8",
+  );
+  const watchdogProfile = JSON.parse(fs.readFileSync(
+    path.resolve(__dirname, "watchdog-linux-features.json"),
+    "utf8",
+  ));
+
+  assert.deepEqual(watchdogProfile.enabled, [
+    "appshots",
+    "codex-micro",
+    "codex-wrapper-updater",
+    "directory-only-working-tree-watch",
+    "frameless-titlebar",
+    "global-dictation",
+    "mcp-helper-reaper",
+    "node-repl-reaper",
+    "open-target-discovery",
+    "persistent-status-panel",
+    "remote-control-ui",
+    "remote-mobile-control",
+    "ui-tweaks",
+  ]);
+  assert.match(script, /NIX_VERIFY_OUTPUTS/);
+  assert.match(script, /NIX_COMPARE_REF/);
+  assert.match(workflow, /\.#checks\.x86_64-linux\.watchdog-linux-features/);
+  assert.match(refreshWorkflow, /NIX_VERIFY_OUTPUTS/);
+  assert.match(refreshWorkflow, /\.#checks\.x86_64-linux\.watchdog-linux-features/);
+  assert.match(script, /Invalid Nix verification output/);
+  assert.match(script, /run_nix_build "\$VERIFY_LOG" "\$\{PACKAGE_OUTPUTS\[@\]\}"/);
+});
+
+test("local Node syntax checks parse native .js ESM in module mode", () => {
+  const script = fs.readFileSync(
+    path.resolve(__dirname, "run-node-checks.sh"),
+    "utf8",
+  );
+
+  assert.match(script, /node --input-type=module --check/);
+  assert.match(script, /grep -Eq .*import.*export/);
 });

@@ -3,6 +3,11 @@
 <p align="center">
   <a href="https://github.com/ilysenko/codex-desktop-linux/actions/workflows/ci.yml"><img src="https://github.com/ilysenko/codex-desktop-linux/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/ilysenko/codex-desktop-linux/actions/workflows/upstream-build-app.yml"><img src="https://github.com/ilysenko/codex-desktop-linux/actions/workflows/upstream-build-app.yml/badge.svg" alt="Upstream Build App"></a>
+  <a href="https://discord.gg/skCB3DXqgw"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Join the Discord community"></a>
+</p>
+
+<p align="center">
+  English | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 Unofficial Linux build wrapper for [OpenAI ChatGPT Desktop](https://chatgpt.com/features/desktop/).
@@ -21,7 +26,8 @@ rebuilds future Linux packages from newer upstream DMGs.
   <a href="#updates">Updates</a> ·
   <a href="#build-package-and-run">Build</a> ·
   <a href="#troubleshooting">Troubleshooting</a> ·
-  <a href="#project-docs">Docs</a>
+  <a href="#project-docs">Docs</a> ·
+  <a href="https://discord.gg/skCB3DXqgw">Discord</a>
 </p>
 
 Before opening a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md). For
@@ -45,6 +51,7 @@ cd codex-desktop-linux
 | Platform | Recommended path | Notes |
 |---|---|---|
 | Debian, Ubuntu, Pop!_OS, Mint, Elementary | `make bootstrap-native` | Builds and installs a `.deb` |
+| Raspberry Pi 5 (64-bit) | `make bootstrap-native` | Validated on a 16 GB Pi 5; see [Raspberry Pi 5](docs/raspberry-pi-5.md) |
 | Fedora | `make bootstrap-native` | Builds and installs an `.rpm` |
 | openSUSE | `make bootstrap-native` | Builds and installs an `.rpm` |
 | Arch, Manjaro, EndeavourOS | `make bootstrap-native` | Builds and installs a pacman package |
@@ -196,7 +203,7 @@ workarounds.
 | Browser annotations | Always | Built into the patched webview | [Architecture](docs/architecture.md) |
 | Tray and warm-start handoff | Always | Normal app launch | [Architecture](docs/architecture.md) |
 | Multiple app instances | Opt-in | `./codex-app/start.sh --new-instance` | [Build and packaging](docs/build-and-packaging.md#running-the-generated-app) |
-| Linux Computer Use backend | Bundled | MCP backend registers by default | [Linux Computer Use](docs/linux-computer-use.md) |
+| Linux Computer Use backend | Bundled | MCP backend registers by default, including compositor-native and generic X11/EWMH window control | [Linux Computer Use](docs/linux-computer-use.md) |
 | Linux Computer Use UI | Opt-in | `CODEX_LINUX_ENABLE_COMPUTER_USE_UI=1` or settings flag | [Linux Computer Use](docs/linux-computer-use.md#enable-the-in-app-ui) |
 | Linux Features framework | Opt-in | Edit `linux-features/features.json` | [Linux Features](linux-features/README.md) |
 
@@ -211,22 +218,29 @@ workarounds.
 | Linux AppShots | Opt-in | `appshots` | [Docs](linux-features/appshots/README.md) |
 | Authenticated proxy | Opt-in | `authenticated-proxy` | [Docs](linux-features/authenticated-proxy/README.md) |
 | Wrapper updater button | Opt-in | `codex-wrapper-updater` | [Docs](linux-features/codex-wrapper-updater/README.md) |
+| Codex Micro (USB-C / Bluetooth) | Opt-in | `codex-micro` | [Docs](linux-features/codex-micro/README.md) |
 | Conversation mode | Opt-in | `conversation-mode` | [Docs](linux-features/conversation-mode/README.md) |
 | Copilot reasoning effort defaults | Opt-in | `copilot-reasoning-effort` | [Docs](linux-features/copilot-reasoning-effort/README.md) |
+| Directory-only working-tree watch | Opt-in | `directory-only-working-tree-watch` | [Docs](linux-features/directory-only-working-tree-watch/README.md) |
 | Example Linux Feature | Developer example | `example-feature` | [Docs](linux-features/example-feature/README.md) |
 | Frameless titlebar | Opt-in | `frameless-titlebar` | [Docs](linux-features/frameless-titlebar/README.md) |
 | Global Dictation | Opt-in | `global-dictation` | [Docs](linux-features/global-dictation/README.md) |
 | MCP helper reaper | Opt-in | `mcp-helper-reaper` | [Docs](linux-features/mcp-helper-reaper/README.md) |
 | Browser Use node_repl reaper | Opt-in | `node-repl-reaper` | [Docs](linux-features/node-repl-reaper/README.md) |
+| Omarchy theme | Opt-in | `omarchy-theme` | [Docs](linux-features/omarchy-theme/README.md) |
 | Open Target Discovery | Opt-in | `open-target-discovery` | [Docs](linux-features/open-target-discovery/README.md) |
 | Persistent status panel | Opt-in | `persistent-status-panel` | [Docs](linux-features/persistent-status-panel/README.md) |
+| Pet overlay | Opt-in | `pet-overlay` | [Docs](linux-features/pet-overlay/README.md) |
+| Project group Last updated sorting | Opt-in | `project-group-last-updated-sort` | [Docs](linux-features/project-group-last-updated-sort/README.md) |
+| Project task Created sorting | Opt-in | `project-task-sort` | [Docs](linux-features/project-task-sort/README.md) |
 | Read Aloud button | Opt-in | `read-aloud` | [Docs](linux-features/read-aloud/README.md) |
 | Read Aloud MCP | Opt-in | `read-aloud-mcp` | [Docs](linux-features/read-aloud-mcp/README.md) |
 | Remote Control UI gates | Opt-in | `remote-control-ui` | [Docs](linux-features/remote-control-ui/README.md) |
 | Experimental Remote Mobile Control | Opt-in | `remote-mobile-control` | [Docs](linux-features/remote-mobile-control/README.md) |
+| SSH command wrapper | Opt-in | `ssh-command-wrapper` | [Docs](linux-features/ssh-command-wrapper/README.md) |
 | Thorium Chrome Plugin Support | Opt-in | `thorium-chrome-plugin` | [Docs](linux-features/thorium-chrome-plugin/README.md) |
 | UI tweaks | Opt-in | `ui-tweaks` | [Docs](linux-features/ui-tweaks/README.md) |
-| X11/EWMH Computer Use adapter | Opt-in | `x11-ewmh-computer-use` | [Docs](linux-features/x11-ewmh-computer-use/README.md) |
+| Alternative namespaced X11/EWMH Computer Use tools | Opt-in | `x11-ewmh-computer-use` | [Docs](linux-features/x11-ewmh-computer-use/README.md) |
 
 ChatGPT-account model rollouts remain controlled by OpenAI per account.
 Rebuilding this wrapper does not unlock them. API-key-authenticated custom
@@ -351,6 +365,7 @@ Full list: [Troubleshooting](docs/troubleshooting.md).
 ## Project Docs
 
 - [Native setup](docs/native-setup.md)
+- [Raspberry Pi 5](docs/raspberry-pi-5.md)
 - [Nix](docs/nix.md)
 - [Linux Computer Use](docs/linux-computer-use.md)
 - [Record and Replay on Linux](docs/record-and-replay-linux.md)

@@ -7,6 +7,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod abs_pointer;
 mod atspi_tree;
+mod command_runner;
 mod cosmic_helper;
 mod diagnostics;
 mod gnome_extension;
@@ -17,6 +18,7 @@ mod server;
 mod terminal;
 mod windowing;
 mod windows;
+mod ydotool;
 
 use anyhow::{Context, Result};
 

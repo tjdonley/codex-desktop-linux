@@ -5924,6 +5924,115 @@ test("adds Linux launch actions through current setSecondInstanceArgsHandler bun
   );
 });
 
+test("bounds warm-start launch-action socket frames before retaining client input", async () => {
+  const patched = applyPatchTwice(
+    applyLinuxLaunchActionArgsPatch,
+    currentLaunchActionBundleFixture(),
+  );
+  let acceptClient;
+  const server = new EventEmitter();
+  server.close = () => {};
+  server.listen = () => {};
+  const context = {
+    E: false,
+    process: {
+      env: { CODEX_DESKTOP_LAUNCH_ACTION_SOCKET: "/tmp/codex-launch-action-test.sock" },
+      platform: "linux",
+    },
+    require(id) {
+      if (id === "electron") return {};
+      if (id === "node:path") return path;
+      if (id === "node:fs") return { mkdirSync() {}, rmSync() {} };
+      if (id === "node:net") {
+        return {
+          createServer(handler) {
+            acceptClient = handler;
+            return server;
+          },
+        };
+      }
+      throw new Error(`unexpected module: ${id}`);
+    },
+    t: {
+      In: class {
+        add() {}
+      },
+      g(value) {
+        return value;
+      },
+      t() {
+        return false;
+      },
+      y() {
+        return { setSecondInstanceArgsHandler() {} };
+      },
+    },
+    x: null,
+  };
+
+  await vm.runInNewContext(`${patched};CN()`, context);
+  assert.equal(typeof acceptClient, "function");
+
+  function connectClient() {
+    const socket = new EventEmitter();
+    const replies = [];
+    let destroyCalls = 0;
+    socket.destroy = () => {
+      destroyCalls += 1;
+    };
+    socket.end = (reply) => replies.push(reply);
+    socket.setEncoding = () => {};
+    acceptClient(socket);
+    return {
+      socket,
+      replies,
+      get destroyCalls() {
+        return destroyCalls;
+      },
+    };
+  }
+
+  const completed = connectClient();
+  completed.socket.emit(
+    "data",
+    `${JSON.stringify({ argv: ["--new-chat"] })}\n${"x".repeat(1024 * 1024)}`,
+  );
+  let continuedInputReads = 0;
+  completed.socket.emit("data", {
+    get length() {
+      continuedInputReads += 1;
+      return 1024 * 1024;
+    },
+    indexOf() {
+      continuedInputReads += 1;
+      return -1;
+    },
+    [Symbol.toPrimitive]() {
+      continuedInputReads += 1;
+      return "x".repeat(1024 * 1024);
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(completed.replies, ["ok\n"]);
+  assert.equal(completed.destroyCalls, 0);
+  assert.equal(continuedInputReads, 0);
+
+  const oversized = connectClient();
+  oversized.socket.emit("data", "x".repeat(65537));
+  oversized.socket.emit("end");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(oversized.destroyCalls, 1);
+  assert.deepEqual(oversized.replies, []);
+
+  const boundary = connectClient();
+  const validFrame = JSON.stringify({ argv: [] }).padStart(65536, " ");
+  boundary.socket.emit("data", validFrame);
+  assert.equal(boundary.destroyCalls, 0);
+  boundary.socket.emit("data", "\n");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(boundary.replies, ["ok\n"]);
+});
+
 test("uses collision-safe modules for launch-action socket in shadowed startup scopes", () => {
   const source = currentLaunchActionBundleFixture().replace(
     "async function CN(){let{setSecondInstanceArgsHandler:l}=t.y(),g={reportNonFatal(){}}",

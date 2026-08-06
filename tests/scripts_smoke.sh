@@ -606,6 +606,7 @@ SCRIPT
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/package-common.sh"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/patch-chrome-plugin.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/patch-browser-client-iab-socket-scope.js"
+    assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/plugin-containment.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/node-runtime.sh"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/upstream-dmg-intel.js"
     assert_file_exists "$pkg_root/opt/codex-desktop/update-builder/scripts/lib/upstream-dmg-acceptance.js"
@@ -7947,6 +7948,7 @@ test_browser_plugin_marketplace_source_containment() {
     local nested_symlink_browser="$bundled_root/plugins/browser-nested-link"
     local internal_symlink_browser="$bundled_root/plugins/browser-internal-link"
     local outside_browser="$workspace/outside-browser"
+    local outside_browser_client_expected="$workspace/outside-browser-client.expected"
     local staged_root="$workspace/staged/openai-bundled"
     local staged_browser="$staged_root/plugins/browser"
     local staged_marketplace="$staged_root/.agents/plugins/marketplace.json"
@@ -7955,6 +7957,9 @@ test_browser_plugin_marketplace_source_containment() {
     local outside_marketplace="$workspace/outside-marketplace.json"
     local stage_plugins_link="$workspace/stage-plugins-link"
     local failed_copy_plugins="$workspace/failed-copy-plugins"
+    local failed_patch_plugins="$workspace/failed-patch-plugins"
+    local failed_move_plugins="$workspace/failed-move-plugins"
+    local failed_containment_plugins="$workspace/failed-containment-plugins"
     local found=""
     local invalid_marketplace=""
     local plugin_dir=""
@@ -7971,6 +7976,10 @@ test_browser_plugin_marketplace_source_containment() {
             > "$plugin_dir/.codex-plugin/plugin.json"
         printf '%s\n' 'export {};' > "$plugin_dir/scripts/browser-client.mjs"
     done
+    printf '%s\n' \
+        'import{env as Ub}from"node:process";const outsideBrowserMarker=true;' \
+        > "$outside_browser/scripts/browser-client.mjs"
+    cp "$outside_browser/scripts/browser-client.mjs" "$outside_browser_client_expected"
     mkdir -p "$nested_symlink_browser/.codex-plugin"
     printf '%s\n' '{"name":"browser","version":"1.0.0"}' \
         > "$nested_symlink_browser/.codex-plugin/plugin.json"
@@ -7990,7 +7999,15 @@ test_browser_plugin_marketplace_source_containment() {
     ln -s "$bundled_root" "$bundled_root_alias"
     ln -s "$staged_root" "$staged_root_alias"
     mkdir -p "$outside_stage_plugins"
-    mkdir -p "$failed_copy_plugins"
+    mkdir -p \
+        "$failed_copy_plugins/browser" \
+        "$failed_patch_plugins/browser" \
+        "$failed_move_plugins/browser" \
+        "$failed_containment_plugins/browser"
+    printf '%s\n' keep-existing > "$failed_copy_plugins/browser/existing.txt"
+    printf '%s\n' keep-existing > "$failed_patch_plugins/browser/existing.txt"
+    printf '%s\n' keep-existing > "$failed_move_plugins/browser/existing.txt"
+    printf '%s\n' keep-existing > "$failed_containment_plugins/browser/existing.txt"
     printf '%s\n' keep > "$outside_stage_plugins/marker"
     ln -s "$outside_stage_plugins" "$stage_plugins_link"
 
@@ -8006,7 +8023,13 @@ fs.writeFileSync(output, JSON.stringify({
       category: "Unsafe sentinel",
       unsafeSentinel: true,
     },
-    { name: "browser", source: { source: "local", path: "./plugins/browser-renamed" } },
+    {
+      name: "browser",
+      source: { source: "local", path: "./plugins/browser-renamed" },
+      policy: { installation: "AVAILABLE", authentication: "MANUAL" },
+      category: "Validated Browser metadata",
+      safeSentinel: true,
+    },
   ],
 }));
 NODE
@@ -8018,7 +8041,8 @@ NODE
     [ "$found" = "$safe_browser" ] \
         || fail "Expected contained Browser source $safe_browser, got $found"
 
-    write_bundled_plugins_marketplace "$marketplace" "$staged_marketplace" 1 0 0
+    write_bundled_plugins_marketplace \
+        "$marketplace" "$staged_root" "$found" 1 0 0
     node - "$staged_marketplace" <<'NODE'
 const fs = require("fs");
 const marketplace = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -8031,11 +8055,12 @@ if (browser.source?.source !== "local" || browser.source.path !== "./plugins/bro
 }
 if (
   browser.policy?.installation !== "AVAILABLE" ||
-  browser.policy?.authentication !== "ON_INSTALL" ||
-  browser.category !== "Engineering" ||
+  browser.policy?.authentication !== "MANUAL" ||
+  browser.category !== "Validated Browser metadata" ||
+  browser.safeSentinel !== true ||
   "unsafeSentinel" in browser
 ) {
-  throw new Error(`unsafe Browser metadata was preserved: ${JSON.stringify(browser)}`);
+  throw new Error(`selected Browser metadata was not preserved safely: ${JSON.stringify(browser)}`);
 }
 NODE
 
@@ -8063,15 +8088,23 @@ NODE
         fail "Expected a symlinked bundled marketplace root to be rejected: $found"
     fi
 
+    printf '%s\n' \
+        '{"plugins":[{"name":"browser","source":{"source":"local","path":"./plugins/browser-renamed"}}]}' \
+        > "$marketplace"
+    found="$(find_browser_plugin_source "$bundled_root" "$marketplace")" \
+        || fail "Expected the safe Browser source to remain discoverable"
+    [ "$found" = "$safe_browser" ] \
+        || fail "Expected safe Browser source $safe_browser, got $found"
+
     if write_bundled_plugins_marketplace \
-        "$marketplace" "$staged_root_alias/.agents/plugins/marketplace.json" 1 0 0 \
+        "$marketplace" "$staged_root_alias" "$found" 1 0 0 \
         >/dev/null 2>&1; then
         fail "Expected a symlinked staged marketplace root to be rejected"
     fi
     mv "$staged_root/.agents" "$staged_root/.agents-real"
     ln -s "$outside_stage_plugins" "$staged_root/.agents"
     if write_bundled_plugins_marketplace \
-        "$marketplace" "$staged_marketplace" 1 0 0 >/dev/null 2>&1; then
+        "$marketplace" "$staged_root" "$found" 1 0 0 >/dev/null 2>&1; then
         fail "Expected a symlinked staged marketplace metadata directory to be rejected"
     fi
     rm "$staged_root/.agents"
@@ -8081,7 +8114,7 @@ NODE
     rm -f "$staged_marketplace"
     ln -s "$outside_marketplace" "$staged_marketplace"
     if write_bundled_plugins_marketplace \
-        "$marketplace" "$staged_marketplace" 1 0 0 >/dev/null 2>&1; then
+        "$marketplace" "$staged_root" "$found" 1 0 0 >/dev/null 2>&1; then
         fail "Expected a symlinked staged marketplace destination file to be rejected"
     fi
     assert_contains "$outside_marketplace" 'outside marker'
@@ -8101,20 +8134,74 @@ NODE
     ); then
         fail "Expected a failed Browser source copy to propagate"
     fi
-    assert_file_not_exists "$failed_copy_plugins/browser"
+    assert_contains "$failed_copy_plugins/browser/existing.txt" "keep-existing"
+    [ -z "$(find "$failed_copy_plugins" -mindepth 1 -maxdepth 1 -type d \( -name '.browser.tmp.*' -o -name '.browser.backup.*' \) -print -quit)" ] \
+        || fail "Expected failed Browser copy staging artifacts to be cleaned"
+
+    if (
+        warn() { info "$@"; }
+        patch_browser_use_node_repl_process_env_import() { return 72; }
+        stage_browser_plugin_from_upstream "$safe_browser" "$failed_patch_plugins"
+    ); then
+        fail "Expected a failed Browser patch to propagate"
+    fi
+    assert_contains "$failed_patch_plugins/browser/existing.txt" "keep-existing"
+    [ -z "$(find "$failed_patch_plugins" -mindepth 1 -maxdepth 1 -type d \( -name '.browser.tmp.*' -o -name '.browser.backup.*' \) -print -quit)" ] \
+        || fail "Expected failed Browser patch staging artifacts to be cleaned"
+
+    if (
+        warn() { info "$@"; }
+        stage_browser_plugin_from_upstream \
+            "$nested_symlink_browser" "$failed_containment_plugins"
+    ); then
+        fail "Expected post-copy Browser containment validation to fail"
+    fi
+    assert_contains "$failed_containment_plugins/browser/existing.txt" "keep-existing"
+    cmp -s "$outside_browser_client_expected" "$outside_browser/scripts/browser-client.mjs" \
+        || fail "Pre-patch Browser containment validation modified an outside file"
+    [ -z "$(find "$failed_containment_plugins" -mindepth 1 -maxdepth 1 -type d \( -name '.browser.tmp.*' -o -name '.browser.backup.*' \) -print -quit)" ] \
+        || fail "Expected failed Browser containment artifacts to be cleaned"
+
+    if (
+        warn() { info "$@"; }
+        mv() {
+            local -a args=("$@")
+            local offset=0
+            if [ "${args[0]}" = "--" ]; then
+                offset=1
+            fi
+            local source_path="${args[$offset]}"
+            local destination_path="${args[$((offset + 1))]}"
+            if [[ "$source_path" == "$failed_move_plugins/.browser.tmp."* ]] &&
+                [ "$destination_path" = "$failed_move_plugins/browser" ]; then
+                return 73
+            fi
+            command mv "$@"
+        }
+        stage_browser_plugin_from_upstream "$safe_browser" "$failed_move_plugins"
+    ); then
+        fail "Expected a failed Browser final move to propagate"
+    fi
+    assert_contains "$failed_move_plugins/browser/existing.txt" "keep-existing"
+    [ -z "$(find "$failed_move_plugins" -mindepth 1 -maxdepth 1 -type d \( -name '.browser.tmp.*' -o -name '.browser.backup.*' \) -print -quit)" ] \
+        || fail "Expected failed Browser final move artifacts to be cleaned"
 
     for invalid_marketplace in '[]' '"invalid"' '1' 'true'; do
         printf '%s\n' "$invalid_marketplace" > "$marketplace"
         if write_bundled_plugins_marketplace \
-            "$marketplace" "$staged_marketplace" 1 0 0 >/dev/null 2>&1; then
+            "$marketplace" "$staged_root" "$found" 1 0 0 >/dev/null 2>&1; then
             fail "Expected invalid top-level marketplace JSON to be rejected: $invalid_marketplace"
         fi
     done
 
+    printf '%s\n' \
+        '{"plugins":[{"name":"browser","source":{"source":"local","path":"./plugins/browser-renamed"}}]}' \
+        > "$marketplace"
+
     mv "$staged_browser" "$staged_root/plugins/browser-real"
     ln -s "$staged_root/plugins/browser-real" "$staged_browser"
     if write_bundled_plugins_marketplace \
-        "$marketplace" "$staged_marketplace" 1 0 0 \
+        "$marketplace" "$staged_root" "$found" 1 0 0 \
         >/dev/null 2>&1; then
         fail "Expected a symlinked staged Browser directory to be rejected"
     fi
@@ -8134,12 +8221,17 @@ NODE
         || fail "Expected a contained nested Browser source to be found"
     [ "$found" = "$nested_browser" ] \
         || fail "Expected nested Browser source $nested_browser, got $found"
+    printf '%s\n' keep-existing > "$staged_browser/existing.txt"
     (
         warn() { info "$@"; }
         stage_browser_plugin_from_upstream "$found" "$staged_root/plugins"
     ) || fail "Expected a nested Browser source to stage under the fixed Browser name"
     assert_file_exists "$staged_browser/scripts/browser-client.mjs"
-    write_bundled_plugins_marketplace "$marketplace" "$staged_marketplace" 1 0 0
+    assert_file_not_exists "$staged_browser/existing.txt"
+    [ -z "$(find "$staged_root/plugins" -mindepth 1 -maxdepth 1 -type d \( -name '.browser.tmp.*' -o -name '.browser.backup.*' \) -print -quit)" ] \
+        || fail "Expected successful Browser staging artifacts to be cleaned"
+    write_bundled_plugins_marketplace \
+        "$marketplace" "$staged_root" "$found" 1 0 0
     assert_contains "$staged_marketplace" '"path": "./plugins/browser"'
     assert_not_contains "$staged_marketplace" 'vendor/browser-nested'
 }
@@ -8193,6 +8285,42 @@ test_upstream_bundled_skills_staging() {
     [ ! -e "$target_skill/scripts/render_animation_previews.py:com.apple.FinderInfo" ] \
         || fail "Expected macOS sidecar metadata to be removed from staged bundled skills"
     assert_contains "$output_log" "Bundled skills staged from upstream DMG"
+}
+
+test_bundled_resource_staging_rejects_symlinked_resources_ancestor() {
+    info "Checking bundled resource staging rejects a symlinked resources ancestor"
+    local workspace="$TMP_DIR/bundled-resources-symlink-ancestor"
+    local app_dir="$workspace/Codex.app"
+    local install_dir="$workspace/install"
+    local outside_resources="$workspace/outside-resources"
+    local source_skill="$app_dir/Contents/Resources/skills/skills/.curated/hatch-pet"
+    local output_log="$workspace/output.log"
+
+    mkdir -p "$install_dir" "$outside_resources" "$source_skill"
+    make_fake_browser_upstream_app "$app_dir"
+    printf '%s\n' '# Hatch Pet' > "$source_skill/SKILL.md"
+    printf '%s\n' keep-outside > "$outside_resources/marker"
+    ln -s "$outside_resources" "$install_dir/resources"
+
+    if (
+        SCRIPT_DIR="$REPO_DIR"
+        INSTALL_DIR="$install_dir"
+        WORK_DIR="$workspace/work"
+        ARCH="x86_64"
+        ICON_SOURCE="$workspace/missing-icon.png"
+        CODEX_APP_ID="codex-desktop"
+        warn() { echo "[WARN] $*" >&2; }
+        info() { echo "[INFO] $*" >&2; }
+        # shellcheck disable=SC1091
+        source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
+        install_bundled_plugin_resources "$app_dir"
+    ) >"$output_log" 2>&1; then
+        fail "Expected a symlinked resources ancestor to block bundled resource staging"
+    fi
+
+    assert_contains "$outside_resources/marker" "keep-outside"
+    assert_file_not_exists "$outside_resources/skills/skills/.curated/hatch-pet/SKILL.md"
+    assert_contains "$output_log" "Bundled resource staging path contains a symlink"
 }
 
 test_upstream_bundled_skills_validator_guards() {
@@ -8704,7 +8832,8 @@ JSON
     (
         # shellcheck disable=SC1091
         source "$REPO_DIR/scripts/lib/bundled-plugins.sh"
-        write_bundled_plugins_marketplace "$marketplace" "$rewritten" 0 0 0 sites visualize
+        write_bundled_plugins_marketplace \
+            "$marketplace" "$workspace/rewritten" "" 0 0 0 sites visualize
     )
     node - "$rewritten" <<'NODE'
 const fs = require("fs");
@@ -8734,11 +8863,16 @@ test_browser_use_node_repl_glibc_pidfd_patch_static() {
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "GLIBC_2.39"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "GLIBC_2.34"
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "non-pidfd GLIBC_2.39 references remain"
-    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "unexpected shared-library dependencies"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "shared-library dependency"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" 'subprocess.run('
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" '[ldconfig_path, "-p"]'
     assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "unexpected ELF interpreter"
+    assert_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "ELF compatibility validation unavailable"
     assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" 'ldd "$destination"'
     assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "command -v ldd"
     assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "is_browser_use_node_repl_ldd_output_compatible"
+    assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "allowed_needed"
+    assert_not_contains "$REPO_DIR/scripts/lib/bundled-plugins.sh" "allowed_gcc_versions"
 }
 
 test_browser_use_node_repl_static_elf_compatibility() {
@@ -8746,7 +8880,7 @@ test_browser_use_node_repl_static_elf_compatibility() {
     local host_arch
     host_arch="$(uname -m)"
     case "$host_arch" in
-        x86_64|aarch64|arm64) ;;
+        x86_64|aarch64) ;;
         *)
             info "Skipping static ELF compatibility fixture on unsupported host $host_arch"
             return 0
@@ -8760,11 +8894,15 @@ test_browser_use_node_repl_static_elf_compatibility() {
     local destination="$workspace/destination"
     local execution_marker="$workspace/executed-target"
     local tool_marker="$workspace/executed-tool"
+    local ldconfig_args_marker="$workspace/ldconfig-args"
     local compiler
+    local real_ldconfig
     local tool
 
     compiler="$(PATH="$HOST_TOOL_PATH" type -P cc)" \
         || fail "A C compiler is required for the static ELF compatibility test"
+    real_ldconfig="$(PATH="$HOST_TOOL_PATH" type -P ldconfig)" \
+        || fail "ldconfig is required for the static ELF compatibility test"
     mkdir -p "$workspace" "$fake_bin"
     cat > "$source_file" <<'C'
 #include <stdio.h>
@@ -8785,7 +8923,15 @@ int main(void) {
     return 0;
 }
 C
-    "$compiler" -O0 -o "$safe_elf" "$source_file"
+    "$compiler" -O0 -o "$safe_elf" "$source_file" \
+        -Wl,--no-as-needed -l:libdl.so.2 -Wl,--as-needed
+    python3 - "$safe_elf" <<'PY'
+from pathlib import Path
+import sys
+
+if b"libdl.so.2\0" not in Path(sys.argv[1]).read_bytes():
+    raise SystemExit("fixture did not retain its non-fingerprinted libdl dependency")
+PY
 
     for tool in ldd readelf objdump lddtree; do
         cat > "$fake_bin/$tool" <<'SH'
@@ -8798,6 +8944,12 @@ fi
 SH
         chmod 0755 "$fake_bin/$tool"
     done
+    cat > "$fake_bin/ldconfig" <<'SH'
+#!/bin/sh
+printf '%s\n' "$@" > "$CODEX_ELF_LDCONFIG_ARGS"
+exec "$CODEX_REAL_LDCONFIG" "$@"
+SH
+    chmod 0755 "$fake_bin/ldconfig"
 
     (
         warn() { echo "[WARN] $*" >&2; }
@@ -8808,6 +8960,8 @@ SH
 
         CODEX_ELF_EXEC_MARKER="$execution_marker" \
         CODEX_ELF_TOOL_MARKER="$tool_marker" \
+        CODEX_ELF_LDCONFIG_ARGS="$ldconfig_args_marker" \
+        CODEX_REAL_LDCONFIG="$real_ldconfig" \
         PATH="$fake_bin:$HOST_TOOL_PATH" \
             install_browser_use_node_repl_executable_resource \
                 "$safe_elf" "$destination" "static compatibility fixture"
@@ -8816,6 +8970,9 @@ SH
             || fail "Static ELF validation executed the staged target"
         [ -z "$(find "$workspace" -maxdepth 1 -name 'executed-tool.*' -print -quit)" ] \
             || fail "Static ELF validation invoked an external inspection tool"
+        [ "$(cat "$ldconfig_args_marker")" = "-p" ] \
+            || fail "Static ELF validation must invoke ldconfig with only -p"
+        assert_not_contains "$ldconfig_args_marker" "$safe_elf"
 
         local unexpected_dependency="$workspace/unexpected-dependency"
         python3 - "$safe_elf" "$unexpected_dependency" <<'PY'
@@ -8997,6 +9154,106 @@ PY
             "$oversized_elf" "$host_arch" >/dev/null 2>&1; then
             fail "Expected a sparse ELF over the parser size cap to be rejected"
         fi
+
+        local no_ldconfig_bin="$workspace/no-ldconfig-bin"
+        local unavailable_destination="$workspace/unavailable-destination"
+        local unavailable_future_destination="$workspace/unavailable-future-destination"
+        local unavailable_output=""
+        local unavailable_future_output=""
+        mkdir -p "$no_ldconfig_bin"
+        ln -s "$(PATH="$HOST_TOOL_PATH" type -P python3)" "$no_ldconfig_bin/python3"
+        ln -s "$(PATH="$HOST_TOOL_PATH" type -P install)" "$no_ldconfig_bin/install"
+        ln -s "$(PATH="$HOST_TOOL_PATH" type -P rm)" "$no_ldconfig_bin/rm"
+        if ! unavailable_output="$(
+            PATH="$no_ldconfig_bin" \
+                install_browser_use_node_repl_executable_resource \
+                    "$safe_elf" \
+                    "$unavailable_destination" \
+                    "loader-cache-unavailable fixture" 2>&1
+        )"; then
+            fail "Unavailable ldconfig must retain the statically verified runtime"
+        fi
+        assert_file_exists "$unavailable_destination"
+        case "$unavailable_output" in
+            *"compatibility validation is unavailable"*"ldconfig is not available"*) ;;
+            *) fail "Expected a distinct ldconfig-unavailable warning, got: $unavailable_output" ;;
+        esac
+        [ ! -e "$execution_marker" ] \
+            || fail "Unavailable loader-cache validation executed the staged target"
+
+        if unavailable_future_output="$(
+            PATH="$no_ldconfig_bin" \
+                install_browser_use_node_repl_executable_resource \
+                    "$future_glibc" \
+                    "$unavailable_future_destination" \
+                    "future glibc without loader cache fixture" 2>&1
+        )"; then
+            fail "Known future GLIBC requirements must fail without ldconfig"
+        fi
+        assert_file_not_exists "$unavailable_future_destination"
+        case "$unavailable_future_output" in
+            *"exceeds host GLIBC"*) ;;
+            *) fail "Expected static GLIBC rejection before ldconfig, got: $unavailable_future_output" ;;
+        esac
+
+        local arm32_elf="$workspace/arm32-header-fixture"
+        local arm32_destination="$workspace/arm32-destination"
+        local arm32_output=""
+        python3 - "$safe_elf" "$arm32_elf" <<'PY'
+from pathlib import Path
+import struct
+import sys
+
+data = bytearray(Path(sys.argv[1]).read_bytes())
+data[4] = 1
+struct.pack_into("<H", data, 18, 40)
+Path(sys.argv[2]).write_bytes(data)
+PY
+        rm -f "$ldconfig_args_marker"
+        ARCH=armv7l
+        if ! arm32_output="$(
+            CODEX_ELF_LDCONFIG_ARGS="$ldconfig_args_marker" \
+            CODEX_REAL_LDCONFIG="$real_ldconfig" \
+            PATH="$fake_bin:$HOST_TOOL_PATH" \
+                install_browser_use_node_repl_executable_resource \
+                    "$arm32_elf" "$arm32_destination" "ELF32 ARM fixture" 2>&1
+        )"; then
+            fail "ELF32 ARM header-only validation must retain the runtime"
+        fi
+        ARCH="$host_arch"
+        assert_file_exists "$arm32_destination"
+        cmp -s "$arm32_elf" "$arm32_destination" \
+            || fail "ELF32 ARM header-only validation changed the staged runtime"
+        case "$arm32_output" in
+            *"full static dependency validation is unavailable for ELF32 armv7l"*) ;;
+            *) fail "Expected a distinct ELF32 ARM validation warning, got: $arm32_output" ;;
+        esac
+        [ ! -e "$ldconfig_args_marker" ] \
+            || fail "ELF32 ARM header-only validation must not invoke ldconfig"
+        [ ! -e "$execution_marker" ] \
+            || fail "ELF32 ARM header-only validation executed the staged target"
+
+        local no_python_bin="$workspace/no-python-bin"
+        local missing_python_destination="$workspace/missing-python-destination"
+        local missing_python_output=""
+        local missing_python_status=0
+        mkdir -p "$no_python_bin"
+        printf '%s\n' "existing-runtime" > "$missing_python_destination"
+        missing_python_output="$(
+            PATH="$no_python_bin" \
+                install_browser_use_node_repl_executable_resource \
+                    "$safe_elf" \
+                    "$missing_python_destination" \
+                    "missing-python fixture" 2>&1
+        )" || missing_python_status=$?
+        [ "$missing_python_status" -eq 2 ] \
+            || fail "Missing python3 must return validation-unavailable status 2"
+        [ "$(<"$missing_python_destination")" = "existing-runtime" ] \
+            || fail "Missing python3 must preserve the existing staged runtime"
+        case "$missing_python_output" in
+            *"validation is unavailable: python3 is required; preserving any existing runtime"*) ;;
+            *) fail "Expected a distinct missing-python3 warning, got: $missing_python_output" ;;
+        esac
     )
 }
 
@@ -11685,6 +11942,7 @@ main() {
     test_browser_plugin_renamed_upstream_staging
     test_browser_plugin_marketplace_source_containment
     test_upstream_bundled_skills_staging
+    test_bundled_resource_staging_rejects_symlinked_resources_ancestor
     test_upstream_bundled_skills_validator_guards
     test_upstream_bundled_skills_rejects_unsafe_source
     test_upstream_bundled_skills_post_copy_validation

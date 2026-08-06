@@ -443,6 +443,7 @@
       "linuxSubstrate": {
         "requiredPaths": [
           "scripts/lib/bundled-plugins.sh",
+          "scripts/lib/plugin-containment.js",
           "scripts/lib/patch-chrome-plugin.js"
         ]
       }

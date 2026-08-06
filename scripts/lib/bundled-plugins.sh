@@ -4,6 +4,25 @@
 # Sourced by install.sh. Do not run directly.
 # shellcheck shell=bash
 
+# Resolve sibling helpers from this source file instead of the caller's
+# working directory. The update-builder copies the helpers together.
+BUNDLED_PLUGIN_CONTAINMENT_HELPER="$(
+    CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd
+)/plugin-containment.js"
+
+remove_bundled_plugin_tree_safely() {
+    local path="$1"
+
+    if declare -F remove_tree_safely >/dev/null 2>&1; then
+        remove_tree_safely "$path"
+        return
+    fi
+
+    [ -e "$path" ] || [ -L "$path" ] || return 0
+    chmod -R u+w "$path" 2>/dev/null || true
+    rm -rf -- "$path"
+}
+
 # ---- Install Linux-safe bundled plugin resources ----
 list_portable_bundled_plugins() {
     local marketplace="$1"
@@ -385,23 +404,46 @@ stage_linux_computer_use_plugin() {
     return 0
 }
 
+browser_use_node_repl_elf_arch_profile() {
+    local arch="$1"
+
+    # Keep raw uname architecture names here. The first field is EI_CLASS,
+    # followed by e_machine and the expected glibc interpreter when the full
+    # ELF64 compatibility parser is available.
+    case "$arch" in
+        x86_64)
+            printf '%s\n' '2|62|/lib64/ld-linux-x86-64.so.2'
+            ;;
+        aarch64)
+            printf '%s\n' '2|183|/lib/ld-linux-aarch64.so.1'
+            ;;
+        armv7l|armv6l|armhf)
+            printf '%s\n' '1|40|'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 is_host_linux_elf_executable() {
     local file="$1"
-    python3 - "$file" "$ARCH" <<'PY'
+    local profile
+    local expected_class
+    local expected_machine
+    local _expected_interpreter
+
+    profile="$(browser_use_node_repl_elf_arch_profile "$ARCH")" || return 1
+    IFS='|' read -r expected_class expected_machine _expected_interpreter <<< "$profile"
+
+    python3 - "$file" "$expected_class" "$expected_machine" <<'PY'
 import pathlib
+import struct
 import sys
 
 path = pathlib.Path(sys.argv[1])
-arch = sys.argv[2]
-expected_machine = {
-    "x86_64": 62,
-    "aarch64": 183,
-    "armv7l": 40,
-    "armv6l": 40,
-    "armhf": 40,
-}.get(arch)
-if expected_machine is None:
-    sys.exit(1)
+expected_class = int(sys.argv[2])
+expected_machine = int(sys.argv[3])
 
 try:
     size = path.stat().st_size
@@ -414,13 +456,11 @@ except OSError:
 
 if len(header) < 20 or header[:4] != b"\x7fELF":
     sys.exit(1)
-
-is_little_endian = header[5] == 1
-if not is_little_endian:
+if header[4] != expected_class or header[5] != 1 or header[6] != 1:
     sys.exit(1)
 
-machine = int.from_bytes(header[18:20], "little")
-sys.exit(0 if machine == expected_machine else 1)
+elf_type, machine = struct.unpack_from("<HH", header, 16)
+sys.exit(0 if elf_type in (2, 3) and machine == expected_machine else 1)
 PY
 }
 
@@ -626,14 +666,41 @@ PY
 validate_browser_use_node_repl_elf_compatibility() {
     local file="$1"
     local arch="$2"
+    local profile
+    local expected_class
+    local expected_machine
+    local expected_interpreter
+    local ldconfig_path=""
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '%s\n' "ELF compatibility validation unavailable: python3 is required" >&2
+        return 2
+    fi
+    if ! profile="$(browser_use_node_repl_elf_arch_profile "$arch")"; then
+        printf '%s\n' "ELF compatibility validation unavailable for architecture $arch" >&2
+        return 2
+    fi
+    IFS='|' read -r expected_class expected_machine expected_interpreter <<< "$profile"
+    ldconfig_path="$(command -v ldconfig 2>/dev/null || true)"
+    case "$ldconfig_path" in
+        /*) ;;
+        *) ldconfig_path="" ;;
+    esac
 
     # Parse the staged ELF as data. ldd may execute a target with an unusual
     # interpreter, so it must never be used on a DMG- or cache-provided binary.
-    python3 - "$file" "$arch" <<'PY'
+    python3 - \
+        "$file" \
+        "$arch" \
+        "$expected_class" \
+        "$expected_machine" \
+        "$expected_interpreter" \
+        "$ldconfig_path" <<'PY'
 import os
 from pathlib import Path
 import re
 import struct
+import subprocess
 import sys
 
 
@@ -641,8 +708,16 @@ class ValidationError(Exception):
     pass
 
 
+class ValidationUnavailable(Exception):
+    pass
+
+
 def reject(message):
     raise ValidationError(message)
+
+
+def unavailable(message):
+    raise ValidationUnavailable(message)
 
 
 def checked_range(data, offset, size, label):
@@ -688,7 +763,93 @@ def elf_hash(value):
     return result & 0xFFFFFFFF
 
 
+def read_elf_identity(path):
+    try:
+        with Path(path).open("rb") as source:
+            header = source.read(20)
+    except OSError:
+        return None
+    if (
+        len(header) < 20
+        or header[:4] != b"\x7fELF"
+        or header[5] != 1
+        or header[6] != 1
+    ):
+        return None
+    elf_type, machine = struct.unpack_from("<HH", header, 16)
+    if elf_type not in (2, 3):
+        return None
+    return header[4], machine
+
+
+def resolve_host_dependencies(dependencies, ldconfig_path, expected_class, expected_machine):
+    if not ldconfig_path:
+        unavailable("ldconfig is not available to query the host loader cache")
+
+    environment = os.environ.copy()
+    for name in (
+        "LD_AUDIT",
+        "LD_DEBUG",
+        "LD_DEBUG_OUTPUT",
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+    ):
+        environment.pop(name, None)
+    environment["LC_ALL"] = "C"
+
+    try:
+        result = subprocess.run(
+            [ldconfig_path, "-p"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=10,
+            env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        unavailable(f"cannot query the host loader cache with ldconfig -p: {exc}")
+    if result.returncode != 0:
+        detail = result.stderr[:512].decode("utf-8", "replace").strip()
+        unavailable(
+            "cannot query the host loader cache with ldconfig -p"
+            + (f": {detail}" if detail else f" (exit {result.returncode})")
+        )
+    if len(result.stdout) > 16 * 1024 * 1024:
+        unavailable("ldconfig -p output exceeds the 16 MiB metadata limit")
+
+    cache_entries = {}
+    for line in result.stdout.decode("utf-8", "surrogateescape").splitlines():
+        left, separator, right = line.partition(" => ")
+        if not separator:
+            continue
+        fields = left.split()
+        if not fields:
+            continue
+        candidate = right.strip()
+        if not os.path.isabs(candidate):
+            continue
+        cache_entries.setdefault(fields[0], []).append(candidate)
+
+    resolved = {}
+    for dependency in dependencies:
+        for candidate in cache_entries.get(dependency, ()):
+            if read_elf_identity(candidate) == (expected_class, expected_machine):
+                resolved[dependency] = candidate
+                break
+        if dependency not in resolved:
+            reject(
+                f"shared-library dependency {dependency!r} is not available "
+                "for the target architecture in the host loader cache"
+            )
+    return resolved
+
+
 def validate(path, arch):
+    expected_class = int(sys.argv[3])
+    expected_machine = int(sys.argv[4])
+    expected_interpreter = sys.argv[5]
+    ldconfig_path = sys.argv[6]
     maximum_size = 128 * 1024 * 1024
     with path.open("rb") as source:
         size = os.fstat(source.fileno()).st_size
@@ -699,23 +860,21 @@ def validate(path, arch):
         reject("file grew beyond the 128 MiB executable limit while being read")
     if len(data) != size:
         reject("file size changed while compatibility metadata was being read")
-    if len(data) < 64 or data[:4] != b"\x7fELF":
+    if len(data) < 24 or data[:4] != b"\x7fELF":
         reject("file is not a complete ELF executable")
-    if data[4] != 2 or data[5] != 1 or data[6] != 1:
-        reject("only little-endian ELF64 executables are supported")
-
-    architecture = {
-        "x86_64": (62, "/lib64/ld-linux-x86-64.so.2"),
-        "aarch64": (183, "/lib/ld-linux-aarch64.so.1"),
-        "arm64": (183, "/lib/ld-linux-aarch64.so.1"),
-    }.get(arch)
-    if architecture is None:
-        reject(f"static compatibility validation is unavailable for {arch}")
-    expected_machine, expected_interpreter = architecture
+    if data[4] != expected_class or data[5] != 1 or data[6] != 1:
+        reject("ELF class, byte order, or identification version does not match the host")
 
     e_type, e_machine, e_version = struct.unpack_from("<HHI", data, 16)
     if e_type not in (2, 3) or e_machine != expected_machine or e_version != 1:
         reject("ELF type, architecture, or version does not match the host")
+    if expected_class == 1:
+        unavailable(
+            f"full static dependency validation is unavailable for ELF32 {arch}; "
+            "the architecture header was verified"
+        )
+    if expected_class != 2 or len(data) < 64:
+        reject("file is not a complete ELF64 executable")
 
     e_phoff = struct.unpack_from("<Q", data, 32)[0]
     e_shoff = struct.unpack_from("<Q", data, 40)[0]
@@ -812,8 +971,11 @@ def validate(path, arch):
     if dynamic["link"] >= len(sections) or sections[dynamic["link"]]["type"] != 3:
         reject("ELF dynamic section does not reference a string table")
     dynstr = sections[dynamic["link"]]
-    if dynstr["size"] > 4 * 1024 * 1024:
-        reject("ELF dynamic string table exceeds the 4 MiB metadata limit")
+    # This is a resource ceiling, not a fingerprint of the current upstream
+    # artifact. It remains below the overall 128 MiB executable limit while
+    # allowing substantially larger future runtime builds.
+    if dynstr["size"] > 64 * 1024 * 1024:
+        reject("ELF dynamic string table exceeds the 64 MiB metadata limit")
     require_unambiguous_load_mapping(dynstr, "ELF dynamic string table")
     dynstr_data = checked_slice(data, dynstr["offset"], dynstr["size"], "ELF dynamic string table")
     if dynamic["size"] % dynamic["entsize"] != 0 or dynamic["size"] // 16 > 4096:
@@ -863,19 +1025,21 @@ def validate(path, arch):
         reject("loader-visible dynamic string table does not match section metadata")
 
     needed = [read_cstr(dynstr_data, offset, "DT_NEEDED") for offset in needed_offsets]
-    allowed_needed = {
-        "libgcc_s.so.1",
-        "libm.so.6",
-        "libc.so.6",
-        Path(expected_interpreter).name,
-    }
     if len(needed) != len(set(needed)):
         reject("ELF contains duplicate shared-library dependencies")
-    unexpected_needed = sorted(set(needed) - allowed_needed)
-    if unexpected_needed:
-        reject("unexpected shared-library dependencies: " + ", ".join(unexpected_needed))
-    if "libc.so.6" not in needed:
-        reject("ELF does not declare the required libc dependency")
+    for dependency in needed:
+        if (
+            not dependency
+            or len(dependency) > 255
+            or "/" in dependency
+            or any(
+                character.isspace()
+                or ord(character) < 0x20
+                or ord(character) == 0x7F
+                for character in dependency
+            )
+        ):
+            reject(f"unsafe shared-library dependency name {dependency!r}")
 
     verneed_indexes = [
         index for index, section in enumerate(sections) if section["type"] == 0x6FFFFFFE
@@ -944,43 +1108,42 @@ def validate(path, arch):
     try:
         host_glibc = os.confstr("CS_GNU_LIBC_VERSION")
     except (AttributeError, OSError, ValueError) as exc:
-        reject(f"cannot determine host glibc version: {exc}")
+        unavailable(f"cannot determine host glibc version: {exc}")
     match = re.fullmatch(r"glibc\s+(\d+)\.(\d+)(?:\.(\d+))?", host_glibc or "")
     if match is None:
-        reject(f"cannot parse host glibc version {host_glibc!r}")
+        unavailable(f"cannot parse host glibc version {host_glibc!r}")
     host_glibc_version = tuple(int(part or 0) for part in match.groups())
 
-    allowed_gcc_versions = {"GCC_3.0", "GCC_3.3", "GCC_4.2.0"}
-    glibc_dependencies = {
-        "libc.so.6",
-        "libm.so.6",
-        Path(expected_interpreter).name,
-    }
     for dependency, version in versions:
         glibc_version = parse_version(version, "GLIBC_")
         if glibc_version is not None:
-            if dependency not in glibc_dependencies:
-                reject(f"{dependency} unexpectedly requires {version}")
             if glibc_version > host_glibc_version:
                 reject(
                     f"required {version} exceeds host GLIBC_{'.'.join(map(str, host_glibc_version))}"
                 )
             continue
         if version == "GLIBC_ABI_DT_RELR":
-            if dependency not in glibc_dependencies:
-                reject(f"{dependency} unexpectedly requires {version}")
             if host_glibc_version < (2, 36, 0):
                 reject("GLIBC_ABI_DT_RELR requires glibc 2.36 or newer")
             continue
-        if version in allowed_gcc_versions:
-            if dependency != "libgcc_s.so.1":
-                reject(f"{dependency} unexpectedly requires {version}")
-            continue
-        reject(f"unexpected required symbol version {version!r}")
+        # Non-glibc provider versions (for example GCC_, GLIBCXX_, CXXABI_,
+        # or ZLIB_) are upstream/toolchain contracts, not a fixed node_repl
+        # fingerprint. The exact provider SONAME is resolved below without
+        # executing the target.
+
+    resolve_host_dependencies(
+        needed,
+        ldconfig_path,
+        expected_class,
+        expected_machine,
+    )
 
 
 try:
     validate(Path(sys.argv[1]), sys.argv[2])
+except ValidationUnavailable as exc:
+    print(f"ELF compatibility validation unavailable: {exc}", file=sys.stderr)
+    sys.exit(2)
 except (OSError, OverflowError, ValueError, struct.error, ValidationError) as exc:
     print(f"unsafe or incompatible ELF metadata: {exc}", file=sys.stderr)
     sys.exit(1)
@@ -993,7 +1156,13 @@ install_browser_use_node_repl_executable_resource() {
     local label="$3"
     local log_level="${4:-warn}"
     local compatibility_error
+    local compatibility_status=0
     local patch_status
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "Browser Use $label validation is unavailable: python3 is required; preserving any existing runtime"
+        return 2
+    fi
 
     if ! install_linux_executable_resource "$source" "$destination" "$label" "$log_level"; then
         return 1
@@ -1010,18 +1179,29 @@ install_browser_use_node_repl_executable_resource() {
         info "Patched Browser Use $label for glibc 2.34+ compatibility"
     fi
 
-    if ! compatibility_error="$(
+    compatibility_error="$(
         validate_browser_use_node_repl_elf_compatibility "$destination" "$ARCH" 2>&1
-    )"; then
-        if [ "$log_level" = "info" ]; then
-            info "Browser Use $label is not compatible with this host runtime; skipping"
-        else
-            warn "Browser Use $label is not compatible with this host runtime; skipping"
-        fi
-        [ -z "$compatibility_error" ] || warn "$compatibility_error"
-        rm -f "$destination"
-        return 1
-    fi
+    )" || compatibility_status=$?
+    case "$compatibility_status" in
+        0)
+            return 0
+            ;;
+        2)
+            warn "Browser Use $label compatibility validation is unavailable; retaining the statically verified runtime"
+            [ -z "$compatibility_error" ] || warn "$compatibility_error"
+            return 0
+            ;;
+        *)
+            if [ "$log_level" = "info" ]; then
+                info "Browser Use $label is not compatible with this host runtime; skipping"
+            else
+                warn "Browser Use $label is not compatible with this host runtime; skipping"
+            fi
+            [ -z "$compatibility_error" ] || warn "$compatibility_error"
+            rm -f "$destination"
+            return 1
+            ;;
+    esac
 }
 
 browser_use_node_repl_runtime_url() {
@@ -1911,128 +2091,25 @@ find_browser_plugin_source() {
     local bundled_root="$1"
     local source_marketplace="$2"
 
-    node - "$bundled_root" "$source_marketplace" <<'NODE'
+    node - \
+        "$bundled_root" \
+        "$source_marketplace" \
+        "$BUNDLED_PLUGIN_CONTAINMENT_HELPER" <<'NODE'
 const fs = require("fs");
 const path = require("path");
+const { createPluginContainmentResolver } = require(process.argv[4]);
 
 const bundledRoot = path.resolve(process.argv[2]);
 const marketplacePath = process.argv[3];
-const candidates = [];
-
-let realBundledRoot;
-try {
-  const bundledRootMetadata = fs.lstatSync(bundledRoot);
-  if (bundledRootMetadata.isSymbolicLink() || !bundledRootMetadata.isDirectory()) {
-    process.exit(1);
-  }
-  realBundledRoot = fs.realpathSync(bundledRoot);
-} catch (_err) {
-  process.exit(1);
-}
-
-function isStrictlyInside(root, candidate) {
-  const relative = path.relative(root, candidate);
-  return (
-    relative.length > 0 &&
-    relative !== ".." &&
-    !relative.startsWith(`..${path.sep}`) &&
-    !path.isAbsolute(relative)
-  );
-}
-
-function hasSymlinkPathComponent(root, candidate) {
-  const relative = path.relative(root, candidate);
-  let current = root;
-  for (const component of relative.split(path.sep)) {
-    current = path.join(current, component);
-    if (fs.lstatSync(current).isSymbolicLink()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isRegularTree(root) {
-  const pending = [root];
-  let entries = 0;
-  while (pending.length > 0) {
-    const directoryPath = pending.pop();
-    const directory = fs.opendirSync(directoryPath);
-    try {
-      let entry;
-      while ((entry = directory.readSync()) !== null) {
-        entries += 1;
-        if (entries > 100000) {
-          return false;
-        }
-        const entryPath = path.join(directoryPath, entry.name);
-        const metadata = fs.lstatSync(entryPath);
-        if (metadata.isSymbolicLink()) {
-          return false;
-        }
-        if (metadata.isDirectory()) {
-          pending.push(entryPath);
-        } else if (!metadata.isFile()) {
-          return false;
-        }
-      }
-    } finally {
-      directory.closeSync();
-    }
-  }
-  return true;
-}
-
-function resolveContainedPluginDirectory(sourcePath) {
-  if (typeof sourcePath !== "string" || sourcePath.length === 0 || path.isAbsolute(sourcePath)) {
-    return null;
-  }
-
-  const candidate = path.resolve(bundledRoot, sourcePath);
-  if (!isStrictlyInside(bundledRoot, candidate)) {
-    return null;
-  }
-
-  try {
-    const metadata = fs.lstatSync(candidate);
-    const realCandidate = fs.realpathSync(candidate);
-    if (
-      metadata.isSymbolicLink() ||
-      !metadata.isDirectory() ||
-      !isStrictlyInside(realBundledRoot, realCandidate) ||
-      !/^[A-Za-z0-9._-]+$/.test(path.basename(candidate)) ||
-      hasSymlinkPathComponent(bundledRoot, candidate) ||
-      !isRegularTree(candidate)
-    ) {
-      return null;
-    }
-    for (const relativePath of [
-      path.join(".codex-plugin", "plugin.json"),
-      path.join("scripts", "browser-client.mjs"),
-    ]) {
-      const requiredPath = path.join(candidate, relativePath);
-      const requiredMetadata = fs.lstatSync(requiredPath);
-      const realRequiredPath = fs.realpathSync(requiredPath);
-      if (
-        requiredMetadata.isSymbolicLink() ||
-        !requiredMetadata.isFile() ||
-        !isStrictlyInside(realCandidate, realRequiredPath)
-      ) {
-        return null;
-      }
-    }
-    const manifest = JSON.parse(
-      fs.readFileSync(path.join(candidate, ".codex-plugin", "plugin.json"), "utf8"),
-    );
-    if (manifest == null || typeof manifest !== "object" || manifest.name !== "browser") {
-      return null;
-    }
-  } catch (_err) {
-    return null;
-  }
-
-  return candidate;
-}
+const candidatePaths = [];
+const resolver = createPluginContainmentResolver(bundledRoot, {
+  requiredFiles: [
+    path.join(".codex-plugin", "plugin.json"),
+    path.join("scripts", "browser-client.mjs"),
+  ],
+  expectedManifestName: "browser",
+  maxEntries: 100000,
+});
 
 try {
   const marketplace = JSON.parse(fs.readFileSync(marketplacePath, "utf8"));
@@ -2045,38 +2122,53 @@ try {
     if (source == null || source.source !== "local") {
       continue;
     }
-    const candidate = resolveContainedPluginDirectory(source.path);
-    if (candidate != null) {
-      candidates.push(candidate);
-    }
+    candidatePaths.push(source.path);
   }
 } catch (_err) {
-  // Fall back to the known upstream directory name below.
-}
-
-const fallback = resolveContainedPluginDirectory("plugins/browser");
-if (fallback != null) {
-  candidates.push(fallback);
+  // A malformed current-upstream marketplace has no trustworthy Browser entry.
 }
 
 const seen = new Set();
-for (const candidate of candidates) {
-  const normalized = path.normalize(candidate);
-  if (seen.has(normalized)) {
+for (const sourcePath of candidatePaths) {
+  if (typeof sourcePath !== "string" || sourcePath.length === 0 || path.isAbsolute(sourcePath)) {
     continue;
   }
-  seen.add(normalized);
-
-  if (
-    fs.existsSync(path.join(normalized, ".codex-plugin", "plugin.json")) &&
-    fs.existsSync(path.join(normalized, "scripts", "browser-client.mjs"))
-  ) {
-    console.log(normalized);
+  const lexicalCandidate = path.resolve(bundledRoot, sourcePath);
+  if (seen.has(lexicalCandidate)) {
+    continue;
+  }
+  seen.add(lexicalCandidate);
+  const resolved = resolver.resolve(sourcePath);
+  if (resolved != null) {
+    console.log(resolved.path);
     process.exit(0);
   }
 }
 
 process.exit(1);
+NODE
+}
+
+validate_staged_browser_plugin_directory() {
+    local root="$1"
+    local relative_plugin="$2"
+
+    node - \
+        "$root" \
+        "$relative_plugin" \
+        "$BUNDLED_PLUGIN_CONTAINMENT_HELPER" <<'NODE'
+const path = require("path");
+const { createPluginContainmentResolver } = require(process.argv[4]);
+
+const resolver = createPluginContainmentResolver(process.argv[2], {
+  requiredFiles: [
+    path.join(".codex-plugin", "plugin.json"),
+    path.join("scripts", "browser-client.mjs"),
+  ],
+  expectedManifestName: "browser",
+  maxEntries: 100000,
+});
+process.exit(resolver.resolve(process.argv[3]) == null ? 1 : 0);
 NODE
 }
 
@@ -2086,7 +2178,9 @@ stage_browser_plugin_from_upstream() {
     local target_name="browser"
     local target_plugin="$target_plugins/$target_name"
     local source_client="$source_plugin/scripts/browser-client.mjs"
-    local target_client="$target_plugin/scripts/browser-client.mjs"
+    local staging_plugin=""
+    local staging_client=""
+    local backup_plugin="$target_plugins/.browser.backup.$$"
 
     if [ -L "$target_plugins" ] || [ ! -d "$target_plugins" ]; then
         warn "Browser plugin staging root is missing or is a symlink"
@@ -2108,23 +2202,78 @@ stage_browser_plugin_from_upstream() {
         return 1
     fi
 
-    if ! rm -rf "$target_plugin"; then
-        warn "Could not replace the staged Browser plugin directory"
+    if ! staging_plugin="$(mktemp -d "$target_plugins/.browser.tmp.XXXXXX")"; then
+        warn "Could not create a temporary Browser plugin staging directory"
         return 1
     fi
-    if ! cp -R "$source_plugin" "$target_plugin"; then
+    staging_client="$staging_plugin/scripts/browser-client.mjs"
+
+    if ! cp -R "$source_plugin/." "$staging_plugin/"; then
         warn "Could not copy the Browser plugin from upstream resources"
-        rm -rf "$target_plugin" || true
+        remove_bundled_plugin_tree_safely "$staging_plugin" \
+            || warn "Could not clean the failed Browser plugin staging directory"
         return 1
     fi
-    remove_macos_sidecar_files "$target_plugin"
-    patch_browser_use_node_repl_process_env_import "$target_client"
-    patch_browser_use_node_repl_env_guard "$target_client"
-    patch_browser_use_node_repl_config_shim "$target_client"
-    patch_browser_use_native_pipe_import_meta_bridge "$target_client"
-    patch_browser_use_site_status_allowlist_fallback "$target_client"
-    patch_browser_use_file_url_policy "$target_client"
-    patch_browser_client_iab_socket_scope "$target_client"
+    if ! validate_staged_browser_plugin_directory \
+        "$target_plugins" "$(basename "$staging_plugin")"; then
+        warn "Copied Browser plugin failed pre-patch containment validation"
+        remove_bundled_plugin_tree_safely "$staging_plugin" \
+            || warn "Could not clean the failed Browser plugin staging directory"
+        return 1
+    fi
+    if ! remove_macos_sidecar_files "$staging_plugin" ||
+        ! patch_browser_use_node_repl_process_env_import "$staging_client" ||
+        ! patch_browser_use_node_repl_env_guard "$staging_client" ||
+        ! patch_browser_use_node_repl_config_shim "$staging_client" ||
+        ! patch_browser_use_native_pipe_import_meta_bridge "$staging_client" ||
+        ! patch_browser_use_site_status_allowlist_fallback "$staging_client" ||
+        ! patch_browser_use_file_url_policy "$staging_client" ||
+        ! patch_browser_client_iab_socket_scope "$staging_client"; then
+        warn "Could not patch the staged Browser plugin"
+        remove_bundled_plugin_tree_safely "$staging_plugin" \
+            || warn "Could not clean the failed Browser plugin staging directory"
+        return 1
+    fi
+
+    if ! validate_staged_browser_plugin_directory \
+        "$target_plugins" "$(basename "$staging_plugin")"; then
+        warn "Patched Browser plugin failed post-patch containment validation"
+        remove_bundled_plugin_tree_safely "$staging_plugin" \
+            || warn "Could not clean the failed Browser plugin staging directory"
+        return 1
+    fi
+
+    if ! remove_bundled_plugin_tree_safely "$backup_plugin"; then
+        warn "Could not prepare the Browser plugin backup path"
+        remove_bundled_plugin_tree_safely "$staging_plugin" || true
+        return 1
+    fi
+    if [ -e "$target_plugin" ] || [ -L "$target_plugin" ]; then
+        if ! mv -- "$target_plugin" "$backup_plugin"; then
+            warn "Could not preserve the existing Browser plugin"
+            remove_bundled_plugin_tree_safely "$staging_plugin" || true
+            return 1
+        fi
+    else
+        backup_plugin=""
+    fi
+    if ! mv -- "$staging_plugin" "$target_plugin"; then
+        remove_bundled_plugin_tree_safely "$staging_plugin" || true
+        if [ -n "$backup_plugin" ]; then
+            if mv -- "$backup_plugin" "$target_plugin"; then
+                warn "Could not install the Browser plugin; previous target was restored"
+            else
+                warn "Could not install the Browser plugin and previous target could not be restored"
+            fi
+        else
+            warn "Could not install the Browser plugin"
+        fi
+        return 1
+    fi
+    if [ -n "$backup_plugin" ] &&
+        ! remove_bundled_plugin_tree_safely "$backup_plugin"; then
+        warn "Could not clean the previous Browser plugin backup: $backup_plugin"
+    fi
 
     info "Browser plugin staged from upstream DMG"
     return 0
@@ -2132,25 +2281,37 @@ stage_browser_plugin_from_upstream() {
 
 write_bundled_plugins_marketplace() {
     local source="$1"
-    local destination="$2"
-    local include_browser="$3"
-    local include_chrome="$4"
-    local include_computer_use="$5"
+    local marketplace_root="$2"
+    local selected_browser_source="$3"
+    local include_browser="$4"
+    local include_chrome="$5"
+    local include_computer_use="$6"
 
-    shift 5
+    shift 6
 
-    node - "$source" "$destination" "$include_browser" "$include_chrome" "$include_computer_use" "$@" <<'NODE'
+    node - \
+        "$source" \
+        "$marketplace_root" \
+        "$selected_browser_source" \
+        "$include_browser" \
+        "$include_chrome" \
+        "$include_computer_use" \
+        "$BUNDLED_PLUGIN_CONTAINMENT_HELPER" \
+        "$@" <<'NODE'
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { createPluginContainmentResolver } = require(process.argv[8]);
 
 const sourcePath = process.argv[2];
-const destinationPath = process.argv[3];
-const marketplaceRoot = path.resolve(path.dirname(destinationPath), "..", "..");
-const includeBrowser = process.argv[4] === "1";
-const includeChrome = process.argv[5] === "1";
-const includeComputerUse = process.argv[6] === "1";
-const portablePluginNames = process.argv.slice(7);
+const marketplaceRoot = path.resolve(process.argv[3]);
+const selectedBrowserSource = process.argv[4];
+const includeBrowser = process.argv[5] === "1";
+const includeChrome = process.argv[6] === "1";
+const includeComputerUse = process.argv[7] === "1";
+const portablePluginNames = process.argv.slice(9);
+const destinationDirectory = path.join(marketplaceRoot, ".agents", "plugins");
+const destinationPath = path.join(destinationDirectory, "marketplace.json");
 const marketplace = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
 if (marketplace == null || typeof marketplace !== "object" || Array.isArray(marketplace)) {
   throw new Error("Bundled marketplace must be a JSON object");
@@ -2162,23 +2323,21 @@ const sourcePlugins = marketplace.plugins || [];
 const plugins = [];
 
 if (includeBrowser) {
-  const marketplacePluginsRoot = path.join(marketplaceRoot, "plugins");
-  let realMarketplacePluginsRoot;
-  try {
-    const marketplaceRootMetadata = fs.lstatSync(marketplaceRoot);
-    const marketplacePluginsMetadata = fs.lstatSync(marketplacePluginsRoot);
-    if (
-      marketplaceRootMetadata.isSymbolicLink() ||
-      !marketplaceRootMetadata.isDirectory() ||
-      marketplacePluginsMetadata.isSymbolicLink() ||
-      !marketplacePluginsMetadata.isDirectory()
-    ) {
-      throw new Error("unsafe staged marketplace root");
-    }
-    realMarketplacePluginsRoot = fs.realpathSync(marketplacePluginsRoot);
-  } catch (_err) {
-    realMarketplacePluginsRoot = null;
+  const stagedResolver = createPluginContainmentResolver(marketplaceRoot, {
+    requiredFiles: [
+      path.join(".codex-plugin", "plugin.json"),
+      path.join("scripts", "browser-client.mjs"),
+    ],
+    expectedManifestName: "browser",
+    maxEntries: 100000,
+  });
+  const stagedBrowser = stagedResolver.resolve("plugins/browser");
+  if (stagedBrowser == null) {
+    throw new Error("Staged Browser plugin path is missing or unsafe");
   }
+
+  const sourceRoot = path.resolve(path.dirname(sourcePath), "..", "..");
+  const selectedPath = path.resolve(selectedBrowserSource);
   const isStrictlyInside = (root, candidate) => {
     const relative = path.relative(root, candidate);
     return (
@@ -2188,118 +2347,32 @@ if (includeBrowser) {
       !path.isAbsolute(relative)
     );
   };
-  const isRegularTree = (root) => {
-    const pending = [root];
-    let entries = 0;
-    while (pending.length > 0) {
-      const directoryPath = pending.pop();
-      const directory = fs.opendirSync(directoryPath);
-      try {
-        let entry;
-        while ((entry = directory.readSync()) !== null) {
-          entries += 1;
-          if (entries > 100000) {
-            return false;
-          }
-          const entryPath = path.join(directoryPath, entry.name);
-          const metadata = fs.lstatSync(entryPath);
-          if (metadata.isSymbolicLink()) {
-            return false;
-          }
-          if (metadata.isDirectory()) {
-            pending.push(entryPath);
-          } else if (!metadata.isFile()) {
-            return false;
-          }
-        }
-      } finally {
-        directory.closeSync();
-      }
+  const browser = sourcePlugins.find((plugin) => {
+    if (plugin == null || typeof plugin !== "object" || plugin.name !== "browser") {
+      return false;
     }
-    return true;
-  };
-  const resolveStagedPluginDirectory = (sourcePath) => {
+    const source = plugin.source;
     if (
-      realMarketplacePluginsRoot == null ||
-      typeof sourcePath !== "string" ||
-      sourcePath.length === 0 ||
-      path.isAbsolute(sourcePath)
+      source == null ||
+      source.source !== "local" ||
+      typeof source.path !== "string" ||
+      source.path.length === 0 ||
+      path.isAbsolute(source.path)
     ) {
-      return null;
+      return false;
     }
-    const candidate = path.resolve(marketplaceRoot, sourcePath);
-    if (!isStrictlyInside(marketplacePluginsRoot, candidate)) {
-      return null;
-    }
-    try {
-      const metadata = fs.lstatSync(candidate);
-      const realCandidate = fs.realpathSync(candidate);
-      if (
-        metadata.isSymbolicLink() ||
-        !metadata.isDirectory() ||
-        !isStrictlyInside(realMarketplacePluginsRoot, realCandidate) ||
-        !/^[A-Za-z0-9._-]+$/.test(path.basename(candidate)) ||
-        !isRegularTree(candidate)
-      ) {
-        return null;
-      }
-      for (const relativePath of [
-        path.join(".codex-plugin", "plugin.json"),
-        path.join("scripts", "browser-client.mjs"),
-      ]) {
-        const requiredPath = path.join(candidate, relativePath);
-        const requiredMetadata = fs.lstatSync(requiredPath);
-        const realRequiredPath = fs.realpathSync(requiredPath);
-        if (
-          requiredMetadata.isSymbolicLink() ||
-          !requiredMetadata.isFile() ||
-          !isStrictlyInside(realCandidate, realRequiredPath)
-        ) {
-          return null;
-        }
-      }
-      const manifest = JSON.parse(
-        fs.readFileSync(path.join(candidate, ".codex-plugin", "plugin.json"), "utf8"),
-      );
-      if (manifest == null || typeof manifest !== "object" || manifest.name !== "browser") {
-        return null;
-      }
-    } catch (_err) {
-      return null;
-    }
-    return candidate;
-  };
-  const stagedBrowserDirectory = resolveStagedPluginDirectory(
-    "./plugins/browser",
-  );
-  if (stagedBrowserDirectory == null) {
-    throw new Error("Staged Browser plugin path is missing or unsafe");
+    const candidate = path.resolve(sourceRoot, source.path);
+    return isStrictlyInside(sourceRoot, candidate) && candidate === selectedPath;
+  });
+  if (browser == null) {
+    throw new Error("Bundled marketplace does not contain the selected Browser plugin");
   }
-  const stagedManifestPath = path.join(
-    stagedBrowserDirectory,
-    ".codex-plugin",
-    "plugin.json",
-  );
-  const manifest = JSON.parse(fs.readFileSync(stagedManifestPath, "utf8"));
-  const category =
-    manifest &&
-    manifest.interface &&
-    typeof manifest.interface.category === "string" &&
-    manifest.interface.category.length > 0 &&
-    manifest.interface.category.length <= 128
-      ? manifest.interface.category
-      : "Engineering";
   plugins.push({
-    name: "browser",
+    ...browser,
     source: {
       source: "local",
       path: "./plugins/browser",
     },
-    policy: {
-      installation: "AVAILABLE",
-      authentication: "ON_INSTALL",
-    },
-    category,
   });
 }
 
@@ -2311,9 +2384,7 @@ if (includeChrome) {
     let name = "chrome";
     let category = "Productivity";
     const stagedManifestPath = path.join(
-      path.dirname(destinationPath),
-      "..",
-      "..",
+      marketplaceRoot,
       "plugins",
       "chrome",
       ".codex-plugin",
@@ -2396,14 +2467,12 @@ plugins.sort((left, right) => {
 });
 
 marketplace.plugins = plugins;
-const destinationDirectory = path.join(marketplaceRoot, ".agents", "plugins");
-const expectedDestinationPath = path.join(destinationDirectory, "marketplace.json");
-if (path.resolve(destinationPath) !== expectedDestinationPath) {
-  throw new Error("Bundled marketplace destination path is outside its fixed staging location");
-}
 const marketplaceRootParent = path.dirname(marketplaceRoot);
-const marketplaceRootParentMetadata = fs.lstatSync(marketplaceRootParent);
+const marketplaceRootParentMetadata = fs.lstatSync(marketplaceRootParent, {
+  throwIfNoEntry: false,
+});
 if (
+  marketplaceRootParentMetadata == null ||
   marketplaceRootParentMetadata.isSymbolicLink() ||
   !marketplaceRootParentMetadata.isDirectory()
 ) {
@@ -2414,27 +2483,19 @@ for (const directoryPath of [
   path.join(marketplaceRoot, ".agents"),
   destinationDirectory,
 ]) {
-  try {
-    const metadata = fs.lstatSync(directoryPath);
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-      throw new Error(`Unsafe bundled marketplace destination directory: ${directoryPath}`);
-    }
-  } catch (error) {
-    if (error?.code !== "ENOENT") {
-      throw error;
-    }
+  const metadata = fs.lstatSync(directoryPath, { throwIfNoEntry: false });
+  if (metadata == null) {
     fs.mkdirSync(directoryPath, { mode: 0o755 });
+  } else if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new Error(`Unsafe bundled marketplace destination directory: ${directoryPath}`);
   }
 }
-try {
-  const metadata = fs.lstatSync(destinationPath);
-  if (metadata.isSymbolicLink() || !metadata.isFile()) {
-    throw new Error("Bundled marketplace destination must be a regular file");
-  }
-} catch (error) {
-  if (error?.code !== "ENOENT") {
-    throw error;
-  }
+const destinationMetadata = fs.lstatSync(destinationPath, { throwIfNoEntry: false });
+if (
+  destinationMetadata != null &&
+  (destinationMetadata.isSymbolicLink() || !destinationMetadata.isFile())
+) {
+  throw new Error("Bundled marketplace destination must be a regular file");
 }
 const temporaryPath = path.join(
   destinationDirectory,
@@ -2476,6 +2537,23 @@ install_bundled_plugin_resources() {
     local include_computer_use=0
     local portable_plugin_names=""
     local portable_plugins=()
+    local staging_component
+
+    # No staging operation may traverse a pre-existing symlink in the managed
+    # install tree, including bundled skills which are staged before plugins.
+    for staging_component in \
+        "$INSTALL_DIR" \
+        "$resources_dir" \
+        "$resources_dir/plugins" \
+        "$bundled_plugins_dir" \
+        "$bundled_plugins_dir/plugins" \
+        "$bundled_plugins_dir/.agents" \
+        "$bundled_plugins_dir/.agents/plugins"; do
+        if [ -L "$staging_component" ]; then
+            warn "Bundled resource staging path contains a symlink: $staging_component"
+            return 1
+        fi
+    done
 
     if ! stage_upstream_bundled_skills "$upstream_resources/skills" "$resources_dir/skills"; then
         return 1
@@ -2486,7 +2564,23 @@ install_bundled_plugin_resources() {
         return 0
     fi
 
-    mkdir -p "$bundled_plugins_dir/plugins" "$bundled_plugins_dir/.agents/plugins"
+    if ! mkdir -p "$bundled_plugins_dir/plugins" "$bundled_plugins_dir/.agents/plugins"; then
+        warn "Could not create the bundled plugin staging root"
+        return 1
+    fi
+    for staging_component in \
+        "$INSTALL_DIR" \
+        "$resources_dir" \
+        "$resources_dir/plugins" \
+        "$bundled_plugins_dir" \
+        "$bundled_plugins_dir/plugins" \
+        "$bundled_plugins_dir/.agents" \
+        "$bundled_plugins_dir/.agents/plugins"; do
+        if [ -L "$staging_component" ] || [ ! -d "$staging_component" ]; then
+            warn "Bundled plugin staging path is not a safe directory: $staging_component"
+            return 1
+        fi
+    done
 
     if ! portable_plugin_names="$(list_portable_bundled_plugins "$source_marketplace")"; then
         warn "Could not parse portable bundled plugins from upstream marketplace"
@@ -2526,7 +2620,8 @@ install_bundled_plugin_resources() {
 
     write_bundled_plugins_marketplace \
         "$source_marketplace" \
-        "$bundled_plugins_dir/.agents/plugins/marketplace.json" \
+        "$bundled_plugins_dir" \
+        "$source_browser_plugin" \
         "$include_browser" \
         "$include_chrome" \
         "$include_computer_use" \

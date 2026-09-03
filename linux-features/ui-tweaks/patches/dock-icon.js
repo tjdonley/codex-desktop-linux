@@ -1,36 +1,36 @@
 "use strict";
 
-const currentPreviewGate = "if(process.platform!==`darwin`||t==null)return null";
+const currentPreviewGate = "function eC(e){if(process.platform!==`darwin`)return null";
 const patchedPreviewGate =
-  "if(process.platform!==`darwin`&&process.platform!==`linux`||t==null)return null";
+  "function eC(e){if(process.platform!==`darwin`&&process.platform!==`linux`)return null";
 const currentAppInfoResource =
-  "function MS(e){if(e==null)return null;let t=l.app.isPackaged?(0,p.join)(process.resourcesPath,e):null";
+  "function tC(e){if(e==null)return null;let t=l.app.isPackaged?(0,p.join)(process.resourcesPath,e):null";
 const patchedAppInfoResource =
-  "function codexLinuxDockIconResourcePath(e){return process.platform===`linux`?(0,p.join)(process.resourcesPath,`dock-icon`,e):(0,p.join)(process.resourcesPath,e)}function MS(e){if(e==null)return null;let t=l.app.isPackaged||process.platform===`linux`?codexLinuxDockIconResourcePath(e):null";
+  "function codexLinuxDockIconResourcePath(e){return process.platform===`linux`?(0,p.join)(process.resourcesPath,`dock-icon`,e):(0,p.join)(process.resourcesPath,e)}function tC(e){if(e==null)return null;let t=l.app.isPackaged||process.platform===`linux`?codexLinuxDockIconResourcePath(e):null";
 const currentWindowResource =
-  "E=e=>{if(!l.app.isPackaged)return null;let t=(0,p.join)(process.resourcesPath,e);return(0,_.existsSync)(t)?t:null}";
+  "D=e=>{if(!l.app.isPackaged)return null;let t=(0,p.join)(process.resourcesPath,e);return(0,_.existsSync)(t)?t:null}";
 const patchedWindowResource =
-  "E=e=>{if(!l.app.isPackaged&&process.platform!==`linux`)return null;let t=codexLinuxDockIconResourcePath(e);return(0,_.existsSync)(t)?t:null}";
+  "D=e=>{if(!l.app.isPackaged&&process.platform!==`linux`)return null;let t=codexLinuxDockIconResourcePath(e);return(0,_.existsSync)(t)?t:null}";
 const currentApplyIcon =
-  "P=t=>{if(t===`app-default`&&i!==a.a.Dev&&(l.app.isPackaged||e===n.gc.ChatGPT)){let e=l.app.dock;e!=null&&Reflect.apply(e.setIcon.bind(e),e,[null]);return}let r=t===`codex-system`?N():null,o=(r==null?null:O(r))??A(),s=o==null?l.nativeImage.createEmpty():l.nativeImage.createFromPath(o);s.isEmpty()||l.app.dock?.setIcon(s)}";
+  "I=e=>{if(e===`app-default`&&t!==a.a.Dev){let e=l.app.dock;e!=null&&Reflect.apply(e.setIcon.bind(e),e,[null]);return}let n=e===`codex-system`?F():null,r=(n==null?null:k(n))??j(),i=r==null?l.nativeImage.createEmpty():l.nativeImage.createFromPath(r);if(!i.isEmpty()){if(e===`codex-system`){let{width:e,height:t}=i.getSize(),n=Math.round(e/128);i=i.crop({x:n,y:n,width:e-n*2,height:t-n*2})}l.app.dock?.setIcon(i)}}";
 const patchedApplyIcon =
-  "P=function codexLinuxApplyDockIcon(t){if(t===`app-default`&&process.platform!==`linux`&&i!==a.a.Dev&&(l.app.isPackaged||e===n.gc.ChatGPT)){let e=l.app.dock;e!=null&&Reflect.apply(e.setIcon.bind(e),e,[null]);return}let r=t===`codex-system`?N():null,o=(r==null?null:O(r))??A(),s=o==null?l.nativeImage.createEmpty():l.nativeImage.createFromPath(o);if(s.isEmpty())return;if(process.platform===`linux`){let codexLinuxIconSelection=t===`codex-system`?(l.nativeTheme.shouldUseDarkColorsForSystemIntegratedUI?`codex-dark`:`codex-light`):`chatgpt`;codexLinuxIconSelection===`codex-dark`?s=s.crop({x:34,y:34,width:956,height:956}):codexLinuxIconSelection===`codex-light`&&(s=s.crop({x:13,y:23,width:998,height:998}));globalThis.codexLinuxDockIconImage=s;for(let e of l.BrowserWindow.getAllWindows())e.isDestroyed()||e.setIcon(s);codexLinuxTray!=null&&!codexLinuxTray.isDestroyed()&&codexLinuxTray.setImage(s);let codexLinuxSyncScript=codexLinuxDockIconResourcePath(`sync-desktop-icon.sh`);if(_.existsSync(codexLinuxSyncScript))try{let e=require(`node:child_process`).spawn(codexLinuxSyncScript,[codexLinuxIconSelection],{detached:!0,stdio:[`pipe`,`ignore`,`ignore`]});e.on(`error`,()=>{}),e.stdin.on(`error`,()=>{}),e.stdin.end(s.toPNG()),e.unref()}catch(e){}return}l.app.dock?.setIcon(s)}";
+  "I=function codexLinuxApplyDockIcon(e){if(e===`app-default`&&process.platform!==`linux`&&t!==a.a.Dev){let e=l.app.dock;e!=null&&Reflect.apply(e.setIcon.bind(e),e,[null]);return}let n=e===`codex-system`?F():null,r=(n==null?null:k(n))??j(),i=r==null?l.nativeImage.createEmpty():l.nativeImage.createFromPath(r);if(i.isEmpty())return;if(process.platform!==`linux`&&e===`codex-system`){let{width:e,height:t}=i.getSize(),n=Math.round(e/128);i=i.crop({x:n,y:n,width:e-n*2,height:t-n*2})}if(process.platform===`linux`){let codexLinuxIconSelection=e===`codex-system`?(l.nativeTheme.shouldUseDarkColorsForSystemIntegratedUI?`codex-dark`:`codex-light`):`chatgpt`;globalThis.codexLinuxDockIconImage=i;for(let e of l.BrowserWindow.getAllWindows())e.isDestroyed()||e.setIcon(i);U9!=null&&!U9.tray.isDestroyed()&&U9.tray.setImage(i);let codexLinuxSyncScript=codexLinuxDockIconResourcePath(`sync-desktop-icon.sh`);if(_.existsSync(codexLinuxSyncScript))try{let e=require(`node:child_process`).spawn(codexLinuxSyncScript,[codexLinuxIconSelection],{detached:!0,stdio:[`pipe`,`ignore`,`ignore`]});e.on(`error`,()=>{}),e.stdin.on(`error`,()=>{}),e.stdin.end(i.toPNG()),e.unref()}catch(e){}return}l.app.dock?.setIcon(i)}";
 const currentUpdateGate =
-  "F=()=>{if(!v)return;let e=k();P(e),Yce({preference:e,resourceName:e===`codex-system`?M.light:null}).then(e=>{e&&P(k())})}";
+  "ee=()=>{if(!g)return;let e=A();I(e),ome({preference:e,resourceName:e===`codex-system`?P.light:null}).then(e=>{e&&I(A())})}";
 const patchedUpdateGate =
-  "F=()=>{if(!v&&process.platform!==`linux`)return;let e=k();P(e),Yce({preference:e,resourceName:e===`codex-system`?M.light:null}).then(e=>{e&&P(k())})}";
+  "ee=()=>{if(!g&&process.platform!==`linux`)return;let e=A();I(e),ome({preference:e,resourceName:e===`codex-system`?P.light:null}).then(e=>{e&&I(A())})}";
 const currentThemeGate =
-  "if(v){F();let e=()=>{let e=k();e===`codex-system`&&P(e)};l.nativeTheme.on(`updated`,e),w.add(()=>{l.nativeTheme.off(`updated`,e)})}";
+  "if(g){ee();let e=()=>{let e=A();e===`codex-system`&&I(e)};l.nativeTheme.on(`updated`,e),w.add(()=>{l.nativeTheme.off(`updated`,e)})}";
 const patchedThemeGate =
-  "if(v||process.platform===`linux`){F();let e=()=>{let e=k();e===`codex-system`&&P(e)};l.nativeTheme.on(`updated`,e),w.add(()=>{l.nativeTheme.off(`updated`,e)})}";
+  "if(g||process.platform===`linux`){ee();let e=()=>{let e=A();e===`codex-system`&&I(e)};l.nativeTheme.on(`updated`,e),w.add(()=>{l.nativeTheme.off(`updated`,e)})}";
 const currentWindowRegistration =
-  "onWindowRegistered:e=>{I?.registerWindow(e),C?.(e)}";
+  "onWindowRegistered:e=>{L?.registerWindow(e),C?.(e)}";
 const patchedWindowRegistration =
-  "onWindowRegistered:e=>{I?.registerWindow(e),C?.(e),process.platform===`linux`&&setImmediate(F)}";
-const currentTrayRegistration =
-  "n=codexLinuxRegisterTray(new l.Tray(t.defaultIcon));if(!W9)return";
-const patchedTrayRegistration =
-  "n=codexLinuxRegisterTray(new l.Tray(process.platform===`linux`&&globalThis.codexLinuxDockIconImage&&!globalThis.codexLinuxDockIconImage.isEmpty()?globalThis.codexLinuxDockIconImage:t.defaultIcon));if(!W9)return";
+  "onWindowRegistered:e=>{L?.registerWindow(e),C?.(e),process.platform===`linux`&&setImmediate(ee)}";
+const currentTrayRegistrationPattern =
+  /([A-Za-z_$][\w$]*)=new ([A-Za-z_$][\w$]*)\.Tray\(([A-Za-z_$][\w$]*)\.defaultIcon,process\.platform===`win32`&&\2\.app\.isPackaged\?([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\):void 0\);if\(!([A-Za-z_$][\w$]*)\)return/g;
+const patchedTrayRegistrationPattern =
+  /([A-Za-z_$][\w$]*)=new ([A-Za-z_$][\w$]*)\.Tray\(process\.platform===`linux`&&globalThis\.codexLinuxDockIconImage&&!globalThis\.codexLinuxDockIconImage\.isEmpty\(\)\?globalThis\.codexLinuxDockIconImage:([A-Za-z_$][\w$]*)\.defaultIcon,process\.platform===`win32`&&\2\.app\.isPackaged\?([A-Za-z_$][\w$]*)\(([A-Za-z_$][\w$]*)\):void 0\);if\(!([A-Za-z_$][\w$]*)\)return/g;
 
 const currentMainContracts = [
   currentPreviewGate,
@@ -40,9 +40,7 @@ const currentMainContracts = [
   currentUpdateGate,
   currentThemeGate,
   currentWindowRegistration,
-  currentTrayRegistration,
 ];
-
 const patchedMainContracts = [
   patchedPreviewGate,
   patchedAppInfoResource,
@@ -51,20 +49,10 @@ const patchedMainContracts = [
   patchedUpdateGate,
   patchedThemeGate,
   patchedWindowRegistration,
-  patchedTrayRegistration,
 ];
 
 function countOccurrences(source, needle) {
-  return source.split(needle).length - 1;
-}
-
-function hasCompleteSinglePointContract(source, currentNeedle, patchedNeedle) {
-  if (typeof source !== "string") {
-    return false;
-  }
-  const currentCount = countOccurrences(source, currentNeedle);
-  const patchedCount = countOccurrences(source, patchedNeedle);
-  return (currentCount === 1 && patchedCount === 0) || (currentCount === 0 && patchedCount === 1);
+  return typeof source === "string" ? source.split(needle).length - 1 : 0;
 }
 
 function dockIconConfig(context) {
@@ -83,54 +71,58 @@ function dockIconEnabled(context) {
 function applyDockIconMainPatch(source) {
   const currentCounts = currentMainContracts.map((needle) => countOccurrences(source, needle));
   const patchedCounts = patchedMainContracts.map((needle) => countOccurrences(source, needle));
-
-  if (currentCounts.every((count) => count === 0) && patchedCounts.every((count) => count === 1)) {
+  const currentTrayMatches = matches(source, currentTrayRegistrationPattern);
+  const patchedTrayMatches = matches(source, patchedTrayRegistrationPattern);
+  if (
+    currentCounts.every((count) => count === 0) &&
+    patchedCounts.every((count) => count === 1) &&
+    currentTrayMatches.length === 0 &&
+    patchedTrayMatches.length === 1
+  ) {
     return source;
   }
-
-  if (!currentCounts.every((count) => count === 1) || !patchedCounts.every((count) => count === 0)) {
+  if (
+    !currentCounts.every((count) => count === 1) ||
+    !patchedCounts.every((count) => count === 0) ||
+    currentTrayMatches.length !== 1 ||
+    patchedTrayMatches.length !== 0
+  ) {
     console.warn(
       "WARN: Could not find the complete current Dock icon main-process contract - skipping Dock icon main patch",
     );
     return source;
   }
-
-  return currentMainContracts.reduce(
+  const patchedSource = currentMainContracts.reduce(
     (patchedSource, needle, index) => patchedSource.replace(needle, patchedMainContracts[index]),
     source,
+  );
+  return patchedSource.replace(
+    currentTrayRegistrationPattern,
+    (_match, trayAlias, electronAlias, iconAlias, windowsHelperAlias, flavorAlias, readyAlias) =>
+      `${trayAlias}=new ${electronAlias}.Tray(process.platform===\`linux\`&&globalThis.codexLinuxDockIconImage&&!globalThis.codexLinuxDockIconImage.isEmpty()?globalThis.codexLinuxDockIconImage:${iconAlias}.defaultIcon,process.platform===\`win32\`&&${electronAlias}.app.isPackaged?${windowsHelperAlias}(${flavorAlias}):void 0);if(!${readyAlias})return`,
   );
 }
 
 const currentSettingsGatePattern =
-  /if\(([A-Za-z_$][\w$]*)!==`macOS`\|\|([A-Za-z_$][\w$]*)\.ChatGPT!==`chatgpt`\|\|([A-Za-z_$][\w$]*)\.Agent===`prod`\)return null/g;
+  /return ([A-Za-z_$][\w$]*)!==`macOS`\|\|([A-Za-z_$][\w$]*)===([A-Za-z_$][\w$]*)\.Agent\?null:([A-Za-z_$][\w$]*)/g;
 const patchedSettingsGatePattern =
-  /if\(([A-Za-z_$][\w$]*)!==`macOS`&&\1!==`linux`\|\|([A-Za-z_$][\w$]*)\.ChatGPT!==`chatgpt`\|\|([A-Za-z_$][\w$]*)\.Agent===`prod`\)return null/g;
-const settingsRowAnchorPattern = /\.dockIconPreviews\b/g;
+  /return ([A-Za-z_$][\w$]*)!==`macOS`&&\1!==`linux`\|\|([A-Za-z_$][\w$]*)===([A-Za-z_$][\w$]*)\.Agent\?null:([A-Za-z_$][\w$]*)/g;
+const settingsRowAnchorPattern = /\bdockIconPreviews\b/g;
 
-function settingsGateMatches(source, pattern) {
+function matches(source, pattern) {
+  if (typeof source !== "string") return [];
   pattern.lastIndex = 0;
   return [...source.matchAll(pattern)];
 }
 
 function dockIconSettingsContract(source) {
-  if (typeof source !== "string") {
-    return "drifted";
-  }
-  const currentMatches = settingsGateMatches(source, currentSettingsGatePattern);
-  const patchedMatches = settingsGateMatches(source, patchedSettingsGatePattern);
-  const rowAnchors = settingsGateMatches(source, settingsRowAnchorPattern);
-  if (
-    rowAnchors.length === 1 &&
-    currentMatches.length === 1 &&
-    patchedMatches.length === 0
-  ) {
+  const currentMatches = matches(source, currentSettingsGatePattern);
+  const patchedMatches = matches(source, patchedSettingsGatePattern);
+  const rowAnchors = matches(source, settingsRowAnchorPattern);
+  if (rowAnchors.length === 1 && currentMatches.length === 1 && patchedMatches.length === 0) {
     return "current";
   }
-  if (
-    rowAnchors.length === 1 &&
-    currentMatches.length === 0 &&
-    patchedMatches.length === 1
-  ) {
+  if (rowAnchors.length === 1 && currentMatches.length === 0 && patchedMatches.length === 1) {
     return "patched";
   }
   return "drifted";
@@ -138,9 +130,7 @@ function dockIconSettingsContract(source) {
 
 function applyDockIconSettingsPatch(source) {
   const contract = dockIconSettingsContract(source);
-  if (contract === "patched") {
-    return source;
-  }
+  if (contract === "patched") return source;
   if (contract !== "current") {
     console.warn(
       "WARN: Could not find the current Dock icon settings contract - skipping Dock icon settings patch",
@@ -152,30 +142,12 @@ function applyDockIconSettingsPatch(source) {
     (
       _match,
       platformAlias,
-      brandAlias,
       buildFlavorAlias,
-    ) => `if(${platformAlias}!==\`macOS\`&&${platformAlias}!==\`linux\`||${brandAlias}.ChatGPT!==\`chatgpt\`||${buildFlavorAlias}.Agent===\`prod\`)return null`,
+      buildFlavorEnumAlias,
+      previewsAlias,
+    ) =>
+      `return ${platformAlias}!==\`macOS\`&&${platformAlias}!==\`linux\`||${buildFlavorAlias}===${buildFlavorEnumAlias}.Agent?null:${previewsAlias}`,
   );
-}
-
-const currentSearchFilter =
-  "codexLinuxDarwinOnlySettingsSearchMessageIds=new Set([`settings.general.appearance.dockIcon.chatGPT.ariaLabel`,`settings.general.appearance.dockIcon.codex.ariaLabel`,`settings.general.appearance.dockIcon.label`,`settings.general.appearance.dockIcon.row.description`])";
-const patchedSearchFilter =
-  "codexLinuxDarwinOnlySettingsSearchMessageIds=new Set([])";
-
-function applyDockIconSearchPatch(source) {
-  const currentCount = countOccurrences(source, currentSearchFilter);
-  const patchedCount = countOccurrences(source, patchedSearchFilter);
-  if (currentCount === 0 && patchedCount === 1) {
-    return source;
-  }
-  if (currentCount !== 1 || patchedCount !== 0) {
-    console.warn(
-      "WARN: Could not find the current Dock icon settings search contract - skipping Dock icon search patch",
-    );
-    return source;
-  }
-  return source.replace(currentSearchFilter, patchedSearchFilter);
 }
 
 const descriptors = [
@@ -192,31 +164,17 @@ const descriptors = [
     phase: "webview-asset",
     order: 20_950,
     ciPolicy: "optional",
-    pattern: /^general-settings-[A-Za-z0-9_-]+\.js$/,
+    pattern: /^dock-icon-setting-visibility-[A-Za-z0-9_-]+\.js$/,
     assetMatch: (source) => dockIconSettingsContract(source) !== "drifted",
-    missingDescription: "General settings Dock icon bundle",
+    missingDescription: "official Linux Dock icon setting visibility bundle",
     skipDescription: "Dock icon settings row patch",
     enabled: dockIconEnabled,
     apply: applyDockIconSettingsPatch,
-  },
-  {
-    id: "appearance-dock-icon-settings-search",
-    phase: "webview-asset",
-    order: 20_960,
-    ciPolicy: "optional",
-    pattern: /^settings-page-[A-Za-z0-9_-]+\.js$/,
-    assetMatch: (source) =>
-      hasCompleteSinglePointContract(source, currentSearchFilter, patchedSearchFilter),
-    missingDescription: "Settings search bundle",
-    skipDescription: "Dock icon settings search patch",
-    enabled: dockIconEnabled,
-    apply: applyDockIconSearchPatch,
   },
 ];
 
 module.exports = {
   applyDockIconMainPatch,
-  applyDockIconSearchPatch,
   applyDockIconSettingsPatch,
   descriptors,
   dockIconConfig,

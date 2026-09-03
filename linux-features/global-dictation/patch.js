@@ -276,7 +276,7 @@ function applyLinuxGlobalDictationMainProcessPatch(source) {
 
   try {
     const registerPattern = new RegExp(
-      `function (${IDENT})\\(e,t,n\\)\\{if\\((${IDENT})\\(e\\)\\)return (${IDENT})\\(e\\)\\?(${IDENT})\\(e,t,n\\?\\.bareModifierTrigger\\):null;`,
+      `function (${IDENT})\\(e,t,n\\)\\{[\\s\\S]{0,500}?;if\\((${IDENT})\\(e\\)\\)return (${IDENT})\\(e\\)\\?(${IDENT})\\(e,(${IDENT}),n\\?\\.bareModifierTrigger\\):null;`,
       "u",
     );
     const registerMatch = source.match(registerPattern);
@@ -290,11 +290,25 @@ function applyLinuxGlobalDictationMainProcessPatch(source) {
     let patched = replaceUnique(
       source,
       registerPattern,
-      (original) =>
-        original.replace(
-          "{",
-          "{if(process.platform===`linux`&&codexLinuxGlobalDictationUsesWayland())return codexLinuxGlobalDictationPortalRegistration(e,t);",
-        ),
+      (original, _functionName, _bareTest, _bareSupport, _bareRegister, callbacksVar) => {
+        const ownershipCallbacksPattern = new RegExp(
+          `let (${IDENT})=n\\?\\.ownership,(${IDENT})=t\\.onReleased,(${IDENT})=t\\.onCancelled,(${IDENT})=\\1==null\\?t:\\{` +
+            `onPressed:\\(\\)=>\\{\\1\\.isOwner\\(\\)&&t\\.onPressed\\(\\)\\},` +
+            `onReleased:\\2==null\\?void 0:\\(\\)=>\\{\\1\\.isOwner\\(\\)&&\\2\\(\\)\\},` +
+            `onCancelled:\\3==null\\?void 0:\\(\\)=>\\{\\1\\.isOwner\\(\\)&&\\3\\(\\)\\}\\}`,
+          "u",
+        );
+        const withUnavailable = replaceUnique(
+          original,
+          ownershipCallbacksPattern,
+          (match) => `${match.slice(0, -1)},onUnavailable:t.onUnavailable}`,
+          "ownership callback propagation",
+        );
+        return withUnavailable.replace(
+          ";if(",
+          `;if(process.platform===\`linux\`&&codexLinuxGlobalDictationUsesWayland())return codexLinuxGlobalDictationPortalRegistration(e,${callbacksVar});if(`,
+        );
+      },
       "global shortcut registration function",
     );
     patched = `${helperSource()}${patched}`;
@@ -347,24 +361,25 @@ function applyLinuxGlobalDictationMainProcessPatch(source) {
     );
 
     const holdRegistration = new RegExp(
-      `${registerFunctionPattern}\\(e,\\{onPressed:\\(\\)=>\\{this\\.handleHoldHotkeyPressed\\(\\)\\},onReleased:\\(\\)=>\\{this\\.handleHoldHotkeyReleased\\(\\)\\}\\}\\)`,
+      `${registerFunctionPattern}\\(e,\\{(onPressed:\\(\\)=>\\{this\\.handleHoldHotkeyPressed\\(\\)\\},onReleased:\\(\\)=>\\{this\\.handleHoldHotkeyReleased\\(\\)\\},onCancelled:\\(\\)=>\\{[\\s\\S]{0,800}?\\})\\},\\{ownership:(${IDENT})(,bareModifierTrigger:\`cancellablePress\`)\\}\\)`,
       "u",
     );
     patched = replaceUnique(
       patched,
       holdRegistration,
-      `${registerFunction}(e,{onPressed:()=>{this.handleHoldHotkeyPressed()},onReleased:()=>{this.handleHoldHotkeyReleased()},onUnavailable:t=>{this.handleLinuxHotkeyUnavailable(\`hold\`,t)}})`,
+      (_original, callbacks, ownershipVar, extraOptions) =>
+        `${registerFunction}(e,{${callbacks},onUnavailable:n=>{this.handleLinuxHotkeyUnavailable(\`hold\`,n)}},{ownership:${ownershipVar}${extraOptions}})`,
       "hold hotkey registration",
     );
 
     const toggleRegistration = new RegExp(
-      registerFunctionPattern + "\\(e,\\{onPressed:\\(\\)=>\\{this\\.handleToggleHotkeyPressed\\(\\)\\}\\},\\{bareModifierTrigger:`release`\\}\\)",
+      registerFunctionPattern + `\\(e,\\{onPressed:\\(\\)=>\\{this\\.handleToggleHotkeyPressed\\(\\)\\}\\},\\{bareModifierTrigger:\`release\`,ownership:(${IDENT})\\}\\)`,
       "u",
     );
     patched = replaceUnique(
       patched,
       toggleRegistration,
-      registerFunction + "(e,{onPressed:()=>{this.handleToggleHotkeyPressed()},onUnavailable:t=>{this.handleLinuxHotkeyUnavailable(`toggle`,t)}},{bareModifierTrigger:`release`})",
+      (_original, ownershipVar) => registerFunction + `(e,{onPressed:()=>{this.handleToggleHotkeyPressed()},onUnavailable:n=>{this.handleLinuxHotkeyUnavailable(\`toggle\`,n)}},{bareModifierTrigger:\`release\`,ownership:${ownershipVar}})`,
       "toggle hotkey registration",
     );
 
